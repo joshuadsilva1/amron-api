@@ -1,0 +1,82 @@
+serviceAccount.json
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================
+# Virtual Environments
+# ==========================
+venv/
+.venv/
+env/
+ENV/
+
+# ==========================
+# Environment Variables
+# ==========================
+.env
+.env.*
+!.env.example
+
+# ==========================
+# Flask
+# ==========================
+instance/
+.webassets-cache/
+
+# ==========================
+# Logs
+# ==========================
+*.log
+logs/
+
+# ==========================
+# SQLite
+# ==========================
+*.sqlite
+*.sqlite3
+*.db
+
+# ==========================
+# Testing
+# ==========================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ==========================
+# IDEs
+# ==========================
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# ==========================
+# Build
+# ==========================
+build/
+dist/
+*.egg-info/
+
+# ==========================
+# Firebase Secrets
+# ==========================
+firebase-adminsdk*.json
+serviceAccountKey.json
+google-services.json
+GoogleService-Info.plist
+
+# ==========================
+# Misc
+# ==========================
+*.swp
+*.swo
