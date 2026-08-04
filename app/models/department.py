@@ -23,9 +23,26 @@ class DepartmentRoute(db.Model):
     )
 
 class DeptLevel(enum.IntEnum):
+    """Legacy fixed 3-tier hierarchy — superseded by the user-managed
+    DepartmentLevel table below, kept only as the column default and for
+    any code that hasn't been migrated to look levels up dynamically."""
     MIDDLE = 0
     TOP_LEVEL = 1
     FINAL = 2
+
+class DepartmentLevel(db.Model):
+    """A user-defined rung in the factory hierarchy (e.g. Low, Low-Mid,
+    High-Mid, High). Departments store a plain integer `department_level`
+    that matches one of these `rank` values — not a hard foreign key, so
+    existing departments never dangle if a level is renamed. The level
+    with the highest rank is treated as "final" (finished goods / dispatch)
+    everywhere the app used to check for the fixed FINAL enum value."""
+    __tablename__ = 'department_levels'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+    rank = db.Column(db.Integer, unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Department(db.Model):
     __tablename__ = 'departments'

@@ -1,9 +1,17 @@
-from flask import Blueprint, request, jsonify
+import os
+import uuid
+from flask import Blueprint, request, jsonify, current_app
+from werkzeug.utils import secure_filename
 from app import db
 from app.models.transaction import StockTransaction, InternalChallan
-from app.models.item import InternalProduct
+from app.models.item import InternalProduct, DepartmentStock
 from app.models.department import Department
 import datetime
+from app.core.decorators import jwt_required
+from app.core.notify import check_low_stock
+from app.core.storage import upload_file
+
+ALLOWED_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
 
 transactions_bp = Blueprint('transactions', __name__)
 
@@ -11,6 +19,7 @@ transactions_bp = Blueprint('transactions', __name__)
 from app.models.client import Client
 
 @transactions_bp.route('/dispatch', methods=['POST'])
+@jwt_required
 def dispatch_goods():
     data = request.get_json()
     
@@ -61,13 +70,29 @@ def dispatch_goods():
             
         # 5. Deactivate the QR Code (It has left the building)
         bin_record.is_active = 0
-        
+
+        # 6. Audit trail — every other stock-moving path writes one of these
+        db.session.add(StockTransaction(
+            product_id=item_id,
+            department_id=dept_id,
+            transaction_type='OUT',
+            quantity=qty_to_remove,
+            qr_id=bin_record.id,
+            is_manual=0,
+            reason='Dispatch',
+            reference_number=client.name,
+            created_by=data.get('user_name', 'System')
+        ))
+
+        if global_item:
+            check_low_stock(global_item, dept_id)
+
         dispatched_items.append({
             "qr": qr_string,
             "item_name": global_item.name if global_item else "Unknown Item",
             "quantity": qty_to_remove
         })
-        
+
     # 6. Commit the final transaction
     try:
         db.session.commit()
@@ -87,6 +112,7 @@ from app.models.item import InternalProduct
 from app.models.department import Department  # Import it from its correct file
 
 @transactions_bp.route('/challan/history', methods=['GET'])
+@jwt_required
 def get_challan_history():
     """Fetches a complete audit trail of all internal factory movements"""
     
@@ -135,6 +161,7 @@ def get_challan_history():
 from app.models.adjustment import InventoryAdjustment
 
 @transactions_bp.route('/adjust', methods=['POST'])
+@jwt_required
 def adjust_stock():
     """Handles manual inventory corrections (scrap, loss, audits)"""
     data = request.get_json()
@@ -185,6 +212,9 @@ def adjust_stock():
                 bin_record.quantity = 0
                 bin_record.is_active = 0 
 
+    if adjustment_qty < 0 and global_item:
+        check_low_stock(global_item, department_id)
+
     # 4. Log the audit record
     new_adjustment = InventoryAdjustment(
         item_id=item_id,
@@ -209,6 +239,7 @@ def adjust_stock():
 from app.models.department import Department
 
 @transactions_bp.route('/bin/<string:qr_code_string>', methods=['GET'])
+@jwt_required
 def get_bin_details(qr_code_string):
     """Fetches all live data for a specific physical bin"""
     
@@ -245,6 +276,7 @@ def get_bin_details(qr_code_string):
 from datetime import datetime
 
 @transactions_bp.route('/challan/scan', methods=['POST'])
+@jwt_required
 def scanner_challan():
     """Moves physical bins (QR codes) from one department to another"""
     data = request.get_json()
@@ -335,12 +367,30 @@ def scanner_challan():
         new_challan_item = ChallanItem(challan_id=new_challan.id, item_id=item_id, quantity=qty_to_move)
         db.session.add(new_challan_item)
 
+        # Audit trail — one leg out of the sender, one leg into the receiver
+        db.session.add(StockTransaction(
+            product_id=item_id, department_id=from_department_id, transaction_type='OUT',
+            quantity=qty_to_move, qr_id=bin_record.id, challan_id=new_challan.id, is_manual=0,
+            reason='Internal Transfer', reference_number=challan_num,
+            created_by=data.get('user_name', 'Scanner App')
+        ))
+        db.session.add(StockTransaction(
+            product_id=item_id, department_id=to_department_id, transaction_type='IN',
+            quantity=qty_to_move, qr_id=bin_record.id, challan_id=new_challan.id, is_manual=0,
+            reason='Internal Transfer', reference_number=challan_num,
+            created_by=data.get('user_name', 'Scanner App')
+        ))
+
+        sender_item = InternalProduct.query.get(item_id)
+        if sender_item:
+            check_low_stock(sender_item, from_department_id)
+
     # 4. COMMIT EVERYTHING
     try:
         db.session.commit()
         return jsonify({
-            "status": "success", 
-            "message": f"Successfully transferred {len(qr_codes)} bin(s)", 
+            "status": "success",
+            "message": f"Successfully transferred {len(qr_codes)} bin(s)",
             "challan_number": new_challan.challan_number
         }), 201
     except Exception as e:
@@ -351,27 +401,28 @@ def scanner_challan():
 # 1. AUTOMATED QR SCANNING
 # ==========================================
 @transactions_bp.route('/scan', methods=['POST'])
+@jwt_required
 def handle_qr_scan():
     data = request.get_json()
-    qr_uuid = data.get('qr_uuid')
+    qr_code_string = data.get('qr_code_string')
     transaction_type = data.get('transaction_type')
     department_id = data.get('department_id') # Changed to expect ID
-    
-    if not all([qr_uuid, transaction_type, department_id]):
+
+    if not all([qr_code_string, transaction_type, department_id]):
         return jsonify({"error": "Missing required fields"}), 400
 
     # Validate Department exists
     if not Department.query.get(department_id):
         return jsonify({"error": "Invalid department ID"}), 404
 
-    qr_code = QRCodeRegistry.query.filter_by(qr_uuid=qr_uuid).first()
+    qr_code = QRCodeRegistry.query.filter_by(qr_code_string=qr_code_string).first()
     if not qr_code:
         return jsonify({"error": "Invalid QR Code."}), 404
 
-    if qr_code.is_consumed == 1:
+    if qr_code.is_active == 0:
         return jsonify({"error": "QR code already consumed."}), 400
 
-    product = InternalProduct.query.get(qr_code.product_id)
+    product = InternalProduct.query.get(qr_code.item_id)
     if not product:
         return jsonify({"error": "Product not found."}), 404
 
@@ -389,7 +440,28 @@ def handle_qr_scan():
         product.current_stock += qr_code.quantity
     elif transaction_type.upper() == 'OUT':
         product.current_stock -= qr_code.quantity
-        qr_code.is_consumed = 1 
+        qr_code.is_active = 0
+
+    # Keep the department-level breakdown in sync with the factory total —
+    # every other stock path (receive, challan/scan) does this; this one
+    # was silently only updating current_stock.
+    dept_stock = DepartmentStock.query.filter_by(
+        item_id=product.id, department_id=department_id
+    ).first()
+    if dept_stock:
+        if transaction_type.upper() == 'IN':
+            dept_stock.quantity += qr_code.quantity
+        else:
+            dept_stock.quantity -= qr_code.quantity
+    else:
+        db.session.add(DepartmentStock(
+            item_id=product.id,
+            department_id=department_id,
+            quantity=qr_code.quantity if transaction_type.upper() == 'IN' else -qr_code.quantity
+        ))
+
+    if transaction_type.upper() == 'OUT':
+        check_low_stock(product, department_id)
 
     try:
         db.session.add(new_transaction)
@@ -404,17 +476,27 @@ def handle_qr_scan():
 # 2. MANUAL STOCK ADJUSTMENTS
 # ==========================================
 @transactions_bp.route('/manual', methods=['POST'])
+@jwt_required
 def manual_adjustment():
     data = request.get_json()
     
     product_id = data.get('product_id')
     transaction_type = data.get('transaction_type')
-    quantity = data.get('quantity')
     department_id = data.get('department_id') # Changed to expect ID
     reason = data.get('reason')
-    
-    if not all([product_id, transaction_type, quantity, department_id, reason]):
+
+    if not all([product_id, transaction_type, data.get('quantity'), department_id, reason]):
         return jsonify({"error": "Product, type, quantity, department ID, and reason are required"}), 400
+
+    try:
+        quantity = float(data.get('quantity'))
+        if quantity <= 0:
+            return jsonify({"error": "Quantity must be greater than zero"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": "Quantity must be a number"}), 400
+
+    if transaction_type.upper() not in ('IN', 'OUT'):
+        return jsonify({"error": "transaction_type must be 'IN' or 'OUT'"}), 400
 
     if not Department.query.get(department_id):
         return jsonify({"error": "Invalid department ID"}), 404
@@ -427,7 +509,7 @@ def manual_adjustment():
         product_id=product.id,
         department_id=department_id, # Updated
         transaction_type=transaction_type.upper(),
-        quantity=int(quantity),
+        quantity=quantity,
         is_manual=1,
         reason=reason,
         reference_number=data.get('reference_number'),
@@ -435,18 +517,81 @@ def manual_adjustment():
     )
 
     if transaction_type.upper() == 'IN':
-        product.current_stock += int(quantity)
+        product.current_stock += quantity
     elif transaction_type.upper() == 'OUT':
-        product.current_stock -= int(quantity)
+        product.current_stock -= quantity
+
+    # Keep the department-level breakdown in sync with the factory total —
+    # every other stock path (receive, challan/scan) does this; this one
+    # was silently only updating current_stock.
+    dept_stock = DepartmentStock.query.filter_by(
+        item_id=product.id, department_id=department_id
+    ).first()
+    if dept_stock:
+        if transaction_type.upper() == 'IN':
+            dept_stock.quantity += quantity
+        else:
+            dept_stock.quantity -= quantity
+    else:
+        db.session.add(DepartmentStock(
+            item_id=product.id,
+            department_id=department_id,
+            quantity=quantity if transaction_type.upper() == 'IN' else -quantity
+        ))
+
+    if transaction_type.upper() == 'OUT':
+        check_low_stock(product, department_id)
 
     try:
         db.session.add(new_transaction)
         db.session.commit()
-        return jsonify({"status": "success", "message": f"Manual {transaction_type} logged."}), 200
+        return jsonify({
+            "status": "success",
+            "message": f"Manual {transaction_type} logged.",
+            "id": new_transaction.id
+        }), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    
+
+
+@transactions_bp.route('/manual/<transaction_id>/photo', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def attach_manual_adjustment_photo(transaction_id):
+    """Attaches a photo (e.g. the physical chalan) to an already-logged
+    manual stock movement. /manual itself is plain JSON with no file
+    support, so this is a second step, same pattern as challan verify."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    transaction = StockTransaction.query.get(transaction_id)
+    if not transaction:
+        return jsonify({"error": "Transaction not found"}), 404
+
+    uploaded_file = None
+    for key in ['file', 'image', 'photo']:
+        if key in request.files:
+            uploaded_file = request.files[key]
+            break
+    if not uploaded_file and len(request.files) > 0:
+        uploaded_file = next(iter(request.files.values()))
+
+    if not uploaded_file or uploaded_file.filename == '':
+        return jsonify({"error": "No image uploaded. Expected multipart/form-data with an image file."}), 400
+
+    ext = os.path.splitext(uploaded_file.filename)[1].lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        return jsonify({"error": f"Unsupported file type '{ext}'. Use jpg, png, webp, or heic."}), 400
+
+    filename = secure_filename(f"{transaction_id}_{uuid.uuid4().hex}{ext}")
+    transaction.image_url = upload_file(uploaded_file, 'manual_adjustments', filename)
+
+    try:
+        db.session.commit()
+        return jsonify({"status": "success", "image_url": transaction.image_url}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
 
 
 
@@ -457,6 +602,7 @@ from app.models.item import InternalProduct, DepartmentStock
 from app.models.department import Department
 
 @transactions_bp.route('/receive', methods=['POST'])
+@jwt_required
 def receive_stock():
     """Receives new raw materials or stock into a specific department"""
     data = request.get_json()
@@ -505,6 +651,18 @@ def receive_stock():
     # 3. Update the Factory's Grand Total
     item.current_stock += quantity
 
+    # Audit trail — every other stock-moving path writes one of these
+    db.session.add(StockTransaction(
+        product_id=item_id,
+        department_id=department_id,
+        transaction_type='IN',
+        quantity=quantity,
+        is_manual=1,
+        reason='Stock Received',
+        reference_number=data.get('reference_number'),
+        created_by=data.get('user_name', 'System')
+    ))
+
     try:
         db.session.commit()
         return jsonify({
@@ -525,6 +683,7 @@ from app.models.transaction import ChallanItem
 # Make sure InternalChallan and ChallanItem are imported here too!
 
 @transactions_bp.route('/challan', methods=['POST'])
+@jwt_required
 def generate_challan():
     data = request.get_json()
     
@@ -547,8 +706,8 @@ def generate_challan():
         return jsonify({"error": "Transaction Blocked: Unauthorized route."}), 403
 
     # 2. CREATE THE CHALLAN RECORD
-    date_str = datetime.datetime.now().strftime("%Y%m%d")
-    unique_suffix = datetime.datetime.now().strftime("%H%M%S")
+    date_str = datetime.now().strftime("%Y%m%d")
+    unique_suffix = datetime.now().strftime("%H%M%S")
     challan_num = f"CH-{date_str}-{unique_suffix}"
 
     new_challan = InternalChallan(
@@ -601,6 +760,24 @@ def generate_challan():
         new_challan_item = ChallanItem(challan_id=new_challan.id, item_id=item_id, quantity=qty_to_move)
         db.session.add(new_challan_item)
 
+        # Audit trail — one leg out of the sender, one leg into the receiver
+        db.session.add(StockTransaction(
+            product_id=item_id, department_id=from_department_id, transaction_type='OUT',
+            quantity=qty_to_move, challan_id=new_challan.id, is_manual=0,
+            reason='Internal Transfer', reference_number=challan_num,
+            created_by=data.get('user_name', 'System')
+        ))
+        db.session.add(StockTransaction(
+            product_id=item_id, department_id=to_department_id, transaction_type='IN',
+            quantity=qty_to_move, challan_id=new_challan.id, is_manual=0,
+            reason='Internal Transfer', reference_number=challan_num,
+            created_by=data.get('user_name', 'System')
+        ))
+
+        item_for_alert = InternalProduct.query.get(item_id)
+        if item_for_alert:
+            check_low_stock(item_for_alert, from_department_id)
+
     # 4. COMMIT EVERYTHING
     try:
         db.session.commit()
@@ -613,6 +790,7 @@ def generate_challan():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 @transactions_bp.route('/challan/verify', methods=['PUT'])
+@jwt_required
 def verify_challan():
     data = request.get_json()
     
@@ -641,20 +819,21 @@ def verify_challan():
         return jsonify({"error": str(e)}), 500
 
 # Add this to your imports at the top
-from app.models.recipe import Recipe, RecipeItem
+from app.models.recipe import ProductBOM
 
 @transactions_bp.route('/produce', methods=['POST'])
+@jwt_required
 def log_production():
     """Logs the manufacturing of a product, consuming raw materials based on the BoM"""
     data = request.get_json()
-    
+
     department_id = data.get('department_id')
     item_id = data.get('item_id') # The finished good being created
     quantity_produced = data.get('quantity')
-    
+
     if not all([department_id, item_id, quantity_produced]):
         return jsonify({"error": "department_id, item_id, and quantity are required"}), 400
-        
+
     try:
         quantity_produced = float(quantity_produced)
         if quantity_produced <= 0:
@@ -662,39 +841,37 @@ def log_production():
     except ValueError:
         return jsonify({"error": "Quantity must be a number"}), 400
 
-    # 1. Verify the Recipe Exists
-    recipe = Recipe.query.filter_by(output_item_id=item_id, is_active=1).first()
-    if not recipe:
+    # 1. Verify the recipe (BOM) exists — built via the Recipe (BOM) Builder screen
+    bom_rows = ProductBOM.query.filter_by(finished_good_id=item_id).all()
+    if not bom_rows:
         return jsonify({"error": "No recipe found for this item. Cannot manufacture."}), 404
-        
+
     # 2. THE SAFETY NET: Check stock for ALL ingredients before deducting anything
-    ingredients = RecipeItem.query.filter_by(recipe_id=recipe.id).all()
-    
     # We store the records here to update them efficiently in the next step
     stock_updates = []
-    
-    for ing in ingredients:
-        total_needed = ing.quantity_required * quantity_produced
-        
+
+    for bom in bom_rows:
+        total_needed = bom.quantity_required * quantity_produced
+
         # Look at the department's physical shelf
         dept_stock = DepartmentStock.query.filter_by(
-            item_id=ing.input_item_id, 
+            item_id=bom.component_id,
             department_id=department_id
         ).with_for_update().first() # Locks the row to prevent double-spending
-        
+
         if not dept_stock or dept_stock.quantity < total_needed:
             db.session.rollback()
-            input_item = InternalProduct.query.get(ing.input_item_id)
+            input_item = InternalProduct.query.get(bom.component_id)
             item_name = input_item.name if input_item else "Unknown Material"
             available = dept_stock.quantity if dept_stock else 0.0
             return jsonify({
                 "error": f"Insufficient raw materials. Need {total_needed} {input_item.unit_of_measure} of {item_name}, but department only has {available}."
             }), 400
-            
+
         stock_updates.append({
             "record": dept_stock,
             "needed": total_needed,
-            "input_item_id": ing.input_item_id
+            "input_item_id": bom.component_id
         })
 
     # 3. CONSUME RAW MATERIALS
@@ -706,6 +883,7 @@ def log_production():
         raw_item = InternalProduct.query.get(update["input_item_id"])
         if raw_item:
             raw_item.current_stock -= update["needed"]
+            check_low_stock(raw_item)
 
     # 4. ADD THE FINISHED GOOD
     fg_stock = DepartmentStock.query.filter_by(
@@ -728,13 +906,25 @@ def log_production():
     if fg_item:
         fg_item.current_stock += quantity_produced
 
-    # 5. COMMIT TRANSACTION
+    # 5. LOG TO THE AUDIT TRAIL — every other stock-moving endpoint does
+    # this; production was silently invisible in transaction history.
+    db.session.add(StockTransaction(
+        product_id=item_id,
+        department_id=department_id,
+        transaction_type='IN',
+        quantity=quantity_produced,
+        is_manual=0,
+        reason='Production',
+        created_by=data.get('user_name', 'Production Log')
+    ))
+
+    # 6. COMMIT TRANSACTION
     try:
         db.session.commit()
         return jsonify({
             "status": "success",
             "message": f"Successfully manufactured {quantity_produced} units of {fg_item.name}.",
-            "raw_materials_consumed": len(ingredients)
+            "raw_materials_consumed": len(bom_rows)
         }), 201
     except Exception as e:
         db.session.rollback()
@@ -744,7 +934,36 @@ def log_production():
 from app.models.qr_code import QRCodeRegistry
 import time
 
+
+
+@transactions_bp.route('/history/<department_id>', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def get_department_transactions(department_id):
+    """Fetches the latest StockTransactions for a specific department to display on the scanner UI"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+        
+    transactions = StockTransaction.query.filter_by(department_id=department_id)\
+        .order_by(StockTransaction.created_at.desc()).limit(20).all()
+        
+    result = []
+    for t in transactions:
+        product = InternalProduct.query.get(t.product_id)
+        result.append({
+            "id": t.id,
+            "item_name": product.name if product else "Unknown Item",
+            "transaction_type": t.transaction_type,
+            "quantity": t.quantity,
+            "reason": t.reason,
+            "reference_number": t.reference_number,
+            "date": t.created_at.strftime("%Y-%m-%d %H:%M")
+        })
+        
+    return jsonify({"status": "success", "data": result}), 200
+
+
 @transactions_bp.route('/generate-qr', methods=['POST'])
+@jwt_required
 def generate_qr():
     """Mints a new QR code for a physical bin of inventory"""
     data = request.get_json()
@@ -804,4 +1023,91 @@ def generate_qr():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-    
+
+
+# ==========================================
+# INTERNAL CHALLAN VERIFICATION (receiving department confirms a handoff)
+# ==========================================
+
+@transactions_bp.route('/challan/pending', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def get_pending_challans():
+    """Lists challans awaiting verification by their receiving department."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    department_id = request.args.get('department_id')
+    query = InternalChallan.query.filter_by(status='Pending_Verification')
+    if department_id:
+        query = query.filter_by(to_department_id=department_id)
+
+    challans = query.order_by(InternalChallan.created_at.desc()).all()
+
+    result = []
+    for c in challans:
+        from_dept = Department.query.get(c.from_department_id)
+        items = ChallanItem.query.filter_by(challan_id=c.id).all()
+        item_list = []
+        for it in items:
+            product = InternalProduct.query.get(it.item_id)
+            item_list.append({
+                "item_name": product.name if product else "Unknown Item",
+                "item_code": product.item_code if product else None,
+                "quantity": it.quantity,
+            })
+        result.append({
+            "id": c.id,
+            "challan_number": c.challan_number,
+            "movement_type": c.movement_type,
+            "from_department_name": from_dept.name if from_dept else "Unknown",
+            "created_by": c.created_by,
+            "created_at": c.created_at.isoformat(),
+            "items": item_list,
+        })
+
+    return jsonify({"status": "success", "data": result}), 200
+
+
+@transactions_bp.route('/challan/<challan_id>/verify', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def verify_challan_with_photo(challan_id):
+    """Receiving department confirms a chalan: attach a photo of the
+    counted goods and mark it Verified in one step."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    challan = InternalChallan.query.get(challan_id)
+    if not challan:
+        return jsonify({"error": "Challan not found"}), 404
+    if challan.status == 'Verified':
+        return jsonify({"error": "This challan has already been verified."}), 400
+
+    uploaded_file = None
+    for key in ['file', 'image', 'photo']:
+        if key in request.files:
+            uploaded_file = request.files[key]
+            break
+    if not uploaded_file and len(request.files) > 0:
+        uploaded_file = next(iter(request.files.values()))
+
+    if not uploaded_file or uploaded_file.filename == '':
+        return jsonify({"error": "No image uploaded. Expected multipart/form-data with an image file."}), 400
+
+    ext = os.path.splitext(uploaded_file.filename)[1].lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        return jsonify({"error": f"Unsupported file type '{ext}'. Use jpg, png, webp, or heic."}), 400
+
+    filename = secure_filename(f"{challan_id}_{uuid.uuid4().hex}{ext}")
+    challan.chalan_image_url = upload_file(uploaded_file, 'internal_challans', filename)
+    challan.status = 'Verified'
+
+    try:
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "message": f"Challan {challan.challan_number} verified.",
+            "chalan_image_url": challan.chalan_image_url,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500

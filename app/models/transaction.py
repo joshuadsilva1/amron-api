@@ -57,7 +57,7 @@ class StockTransaction(db.Model):
     department_id = db.Column(db.String(36), db.ForeignKey('departments.id'), nullable=False)
     
     transaction_type = db.Column(db.String(10), nullable=False) # 'IN' or 'OUT'
-    quantity = db.Column(db.Integer, nullable=False)
+    quantity = db.Column(db.Float, nullable=False)
     
     challan_id = db.Column(db.String(36), db.ForeignKey('internal_challans.id'), nullable=True)
     qr_id = db.Column(db.String(36), db.ForeignKey('qr_code_registry.id'), nullable=True)
@@ -65,6 +65,7 @@ class StockTransaction(db.Model):
     is_manual = db.Column(db.Integer, default=0)
     reason = db.Column(db.String(255))
     reference_number = db.Column(db.String(100))
-    
+    image_url = db.Column(db.String(255), nullable=True)
+
     created_by = db.Column(db.String(100))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)

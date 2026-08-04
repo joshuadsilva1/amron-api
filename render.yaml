@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: amron-api
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: flask db upgrade && gunicorn run:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: FLASK_APP
+        value: run.py
+      - key: FLASK_DEBUG
+        value: "0"
+      - key: SECRET_KEY
+        sync: false
+      - key: JWT_EXPIRY_DAYS
+        value: "7"
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: uploads
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false

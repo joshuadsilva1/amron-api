@@ -2,11 +2,16 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.production import DailyProductionPlan
 from app.models.item import InternalProduct
+from app.models.department import Department
 from datetime import datetime
+from app.core.decorators import jwt_required
+from app.core.notify import create_notification
+
 
 production_bp = Blueprint('production', __name__)
 
 @production_bp.route('/', methods=['POST'])
+@jwt_required
 def create_plan():
     """
     Creates a daily production allocation.
@@ -54,7 +59,7 @@ def create_plan():
         db.session.commit()
         return jsonify({
             "status": "success", 
-            "message": f"Allocated {target_quantity} {product.unit} of {product.name} to {department_name}",
+            "message": f"Allocated {target_quantity} {product.unit_of_measure} of {product.name} to {department_name}",
             "plan_id": new_plan.id
         }), 201
     except Exception as e:
@@ -63,6 +68,7 @@ def create_plan():
 
 
 @production_bp.route('/', methods=['GET'])
+@jwt_required
 def get_plans():
     """
     Fetches production plans. Can be filtered by date or department.
@@ -98,7 +104,7 @@ def get_plans():
             "production_date": plan.production_date.strftime("%Y-%m-%d"),
             "department": plan.department_name,
             "product_name": product.name,
-            "internal_code": product.internal_code,
+            "internal_code": product.item_code,
             "target_quantity": plan.target_quantity,
             "completed_quantity": plan.completed_quantity,
             "priority": plan.priority,
@@ -106,3 +112,64 @@ def get_plans():
         })
         
     return jsonify({"status": "success", "data": formatted_data}), 200
+
+
+@production_bp.route('/send-schedule', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def send_schedule():
+    """Production Manager pushes the day's work allotment out to a
+    department as a single notification, which floor workers see in their
+    Notifications list."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    department_name = data.get('department_name')
+    production_date_str = data.get('production_date')
+
+    if not department_name or not production_date_str:
+        return jsonify({"error": "department_name and production_date are required"}), 400
+
+    try:
+        prod_date = datetime.strptime(production_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+    department = Department.query.filter_by(name=department_name).first()
+    if not department:
+        return jsonify({"error": f"Department '{department_name}' not found"}), 404
+
+    results = db.session.query(DailyProductionPlan, InternalProduct).join(
+        InternalProduct, DailyProductionPlan.product_id == InternalProduct.id
+    ).filter(
+        DailyProductionPlan.department_name == department_name,
+        DailyProductionPlan.production_date == prod_date
+    ).order_by(
+        db.case({'Urgent': 1, 'Normal': 2}, value=DailyProductionPlan.priority)
+    ).all()
+
+    if not results:
+        return jsonify({"error": f"No work allotted for {department_name} on {production_date_str} yet."}), 400
+
+    lines = []
+    for plan, product in results:
+        urgent_tag = " (URGENT)" if plan.priority == 'Urgent' else ""
+        lines.append(f"• {product.name}: {plan.target_quantity} {product.unit_of_measure}{urgent_tag}")
+
+    note = create_notification(
+        title=f"Today's Schedule — {department_name}",
+        message=f"{production_date_str}\n" + "\n".join(lines),
+        department_id=department.id,
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "status": "success",
+        "message": f"Schedule sent to {department_name} ({len(results)} item(s)).",
+        "notification_id": note.id,
+    }), 201

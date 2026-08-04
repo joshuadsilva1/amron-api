@@ -2,76 +2,133 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.recipe import ProductBOM
 from app.models.item import InternalProduct
+from app.core.decorators import jwt_required
 
 recipes_bp = Blueprint('recipes', __name__)
 
 
-from flask import Blueprint, request, jsonify
-from app import db
-from app.models.recipe import Recipe, RecipeItem
-from app.models.item import InternalProduct
+@recipes_bp.route('/', methods=['GET'], strict_slashes=False)
+@jwt_required
+def list_recipes():
+    """Lists every finished good that has at least one BOM row, with its components."""
+    finished_good_ids = [row[0] for row in db.session.query(ProductBOM.finished_good_id).distinct().all()]
 
-recipes_bp = Blueprint('recipes', __name__)
+    result = []
+    for fg_id in finished_good_ids:
+        fg = InternalProduct.query.get(fg_id)
+        if not fg:
+            continue
 
-@recipes_bp.route('/', methods=['POST'])
+        boms = ProductBOM.query.filter_by(finished_good_id=fg_id).all()
+        components = []
+        for b in boms:
+            comp = InternalProduct.query.get(b.component_id)
+            components.append({
+                "id": b.id,
+                "component_id": b.component_id,
+                "component_code": comp.item_code if comp else None,
+                "component_name": comp.name if comp else None,
+                "quantity_required": b.quantity_required,
+                "lazer_needed": b.lazer_needed,
+            })
+
+        result.append({
+            "finished_good_id": fg_id,
+            "finished_good_code": fg.item_code,
+            "finished_good_name": fg.name,
+            "component_count": len(components),
+            "components": components,
+        })
+
+    return jsonify({"status": "success", "data": result}), 200
+
+
+@recipes_bp.route('/', methods=['POST'], strict_slashes=False)
+@jwt_required
 def create_recipe():
+    """
+    Create/replace the BOM for a finished good.
+    Body: {
+      "finished_good_id": "...",
+      "components": [
+         {"component_id": "...", "quantity_required": 5, "lazer_needed": false},
+         ...
+      ]
+    }
+    """
     data = request.get_json()
-    
-    output_item_id = data.get('output_item_id')
-    ingredients = data.get('ingredients', []) # [{"input_item_id": "...", "quantity_required": 0.5}]
-    
-    if not output_item_id or not ingredients:
-        return jsonify({"error": "output_item_id and an array of ingredients are required"}), 400
 
-    # Ensure the output item actually exists
-    output_item = InternalProduct.query.get(output_item_id)
-    if not output_item:
-        return jsonify({"error": "Output item not found in catalog"}), 404
+    finished_good_id = data.get('finished_good_id') or data.get('output_item_id')
+    components = data.get('components') or data.get('ingredients', [])
 
-    # Check if a recipe already exists for this item
-    existing_recipe = Recipe.query.filter_by(output_item_id=output_item_id).first()
-    if existing_recipe:
-        return jsonify({"error": f"A recipe already exists for {output_item.name}"}), 409
+    if not finished_good_id or not components:
+        return jsonify({"error": "finished_good_id and an array of components are required"}), 400
 
-    # 1. Create the Master Recipe
-    new_recipe = Recipe(output_item_id=output_item_id)
-    db.session.add(new_recipe)
-    db.session.flush() # Get the new_recipe.id before committing
+    finished_good = InternalProduct.query.get(finished_good_id)
+    if not finished_good:
+        return jsonify({"error": "Finished good not found in catalog"}), 404
 
-    # 2. Add all the Ingredients
-    for ing in ingredients:
-        input_item_id = ing.get('input_item_id')
-        qty = float(ing.get('quantity_required', 0))
-        
+    # Replace any existing BOM rows for this finished good (so re-saving a
+    # recipe from the UI doesn't create duplicates).
+    ProductBOM.query.filter_by(finished_good_id=finished_good_id).delete()
+
+    for comp in components:
+        component_id = comp.get('component_id') or comp.get('input_item_id')
+        qty = float(comp.get('quantity_required', 0))
+        lazer_needed = bool(comp.get('lazer_needed', False))
+
+        if not component_id:
+            db.session.rollback()
+            return jsonify({"error": "Every component needs a component_id"}), 400
+
         if qty <= 0:
             db.session.rollback()
-            return jsonify({"error": "Ingredient quantities must be greater than zero"}), 400
-            
-        # Verify the ingredient exists
-        if not InternalProduct.query.get(input_item_id):
+            return jsonify({"error": "Component quantities must be greater than zero"}), 400
+
+        if not InternalProduct.query.get(component_id):
             db.session.rollback()
-            return jsonify({"error": f"Ingredient ID {input_item_id} not found"}), 404
-            
-        recipe_item = RecipeItem(
-            recipe_id=new_recipe.id,
-            input_item_id=input_item_id,
-            quantity_required=qty
+            return jsonify({"error": f"Component ID {component_id} not found"}), 404
+
+        bom_row = ProductBOM(
+            finished_good_id=finished_good_id,
+            component_id=component_id,
+            quantity_required=qty,
+            lazer_needed=lazer_needed
         )
-        db.session.add(recipe_item)
+        db.session.add(bom_row)
 
     try:
         db.session.commit()
-        return jsonify({"status": "success", "message": f"Recipe created for {output_item.name}"}), 201
+        return jsonify({"status": "success", "message": f"Recipe saved for {finished_good.name}"}), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
 
+@recipes_bp.route('/<finished_good_id>', methods=['GET'], strict_slashes=False)
+@jwt_required
+def get_recipe(finished_good_id):
+    """Fetch the current BOM for a finished good, for editing/verification."""
+    boms = ProductBOM.query.filter_by(finished_good_id=finished_good_id).all()
+    result = []
+    for b in boms:
+        comp = InternalProduct.query.get(b.component_id)
+        result.append({
+            "id": b.id,
+            "component_id": b.component_id,
+            "component_code": comp.item_code if comp else None,
+            "component_name": comp.name if comp else None,
+            "quantity_required": b.quantity_required,
+            "lazer_needed": b.lazer_needed
+        })
+    return jsonify({"status": "success", "components": result}), 200
+
 
 @recipes_bp.route('/explode', methods=['POST'])
+@jwt_required
 def explode_orders():
     """
-    The Engine: Takes a list of clubbed orders and explodes them 
+    The Engine: Takes a list of clubbed orders and explodes them
     into total aggregated raw material requirements, accounting for complex units.
     """
     data = request.get_json()
@@ -80,9 +137,8 @@ def explode_orders():
     if not orders:
         return jsonify({"error": "No orders provided for explosion"}), 400
 
-    raw_materials_needed = {} 
-    
-    # Unit conversion dictionary to normalize everything to pieces
+    raw_materials_needed = {}
+
     unit_multiplier = {
         "pieces": 1,
         "pcs": 1,
@@ -99,15 +155,13 @@ def explode_orders():
         for bom in boms:
             comp_id = bom.component_id
             comp = InternalProduct.query.get(comp_id)
-            
+
             if not comp:
                 continue
 
-            # Determine the multiplier based on the raw material's unit
-            comp_unit = str(comp.unit).lower() if comp.unit else "pieces"
+            comp_unit = str(comp.unit_of_measure).lower() if comp.unit_of_measure else "pieces"
             multiplier = unit_multiplier.get(comp_unit, 1)
 
-            # Convert the BOM requirement into a normalized quantity
             required_qty = (bom.quantity_required * multiplier) * order_qty
 
             if comp_id in raw_materials_needed:
@@ -121,12 +175,12 @@ def explode_orders():
         if comp:
             result.append({
                 "component_id": comp_id,
-                "internal_code": comp.internal_code,
+                "internal_code": comp.item_code,
                 "component_name": comp.name,
                 "category": comp.category,
-                "sub_category": comp.sub_category,
-                "total_required_normalized": total_qty, # Output is always normalized to base pieces
-                "original_unit": comp.unit
+                "sub_category": comp.subcategory,
+                "total_required_normalized": total_qty,
+                "original_unit": comp.unit_of_measure
             })
 
     return jsonify({"status": "success", "data": result}), 200
