@@ -46,7 +46,11 @@ class User(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
     phone_number = db.Column(db.String(20), unique=True, nullable=False)
     full_name = db.Column(db.String(100))
-    role_id = db.Column(db.Integer, db.ForeignKey('roles.id'), default=1)
+    # New self-registered users (first-time phone login) get PENDING (id 0,
+    # no permissions) until an admin assigns a real role — was previously
+    # defaulting to 1 (ADMIN), silently granting full wildcard access to
+    # anyone who verified any phone number.
+    role_id = db.Column(db.Integer, db.ForeignKey('roles.id'), default=0)
     department_id = db.Column(db.String(36), db.ForeignKey("departments.id"))
     is_active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
