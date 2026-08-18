@@ -7,7 +7,7 @@ from .supplier_order import SupplierOrder, SupplierOrderItem
 
 # New Floor Operations Models
 from .transaction import InternalChallan, StockTransaction
-from .production import DailyProductionPlan
+from .production import DailyProductionPlan, ProductionPlanDay
 from .department import Department, DepartmentLevel # Add this
 from .qr_code import QRCodeRegistry
 from .quality import QualityInspectionLog
