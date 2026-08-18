@@ -1,5 +1,5 @@
 from .client import Client
-from .supplier import Supplier
+from .supplier import Supplier, SupplierItem
 from .item import InternalProduct, OEMCompanyCode, BoxMapping
 from .recipe import ProductBOM, BOMVersion
 from .order import PurchaseOrder, POLineItem

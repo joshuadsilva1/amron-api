@@ -3,18 +3,10 @@ from app import db
 from app.models.recipe import ProductBOM, BOMVersion
 from app.models.item import InternalProduct
 from app.core.decorators import jwt_required
+from app.core.bom import explode_product_quantity
 from sqlalchemy import func
 
 recipes_bp = Blueprint('recipes', __name__)
-
-MAX_BOM_DEPTH = 12
-
-UNIT_MULTIPLIER = {
-    "pieces": 1,
-    "pcs": 1,
-    "gross": 144,
-    "dozen": 12,
-}
 
 
 def _serialize_components(bom_version):
@@ -187,32 +179,6 @@ def get_recipe_versions(finished_good_id):
     return jsonify({"status": "success", "versions": result}), 200
 
 
-def _explode_component(component_id, qty_needed, visited, depth):
-    """Recurses into a component's own active BOM, if it has one, down to
-    raw materials (components with no BOM of their own = leaves)."""
-    if depth > MAX_BOM_DEPTH:
-        raise ValueError(f"BOM nesting exceeds {MAX_BOM_DEPTH} levels (likely a circular reference)")
-    if component_id in visited:
-        raise ValueError("Circular BOM reference detected — a component's recipe refers back to itself")
-
-    active_version = BOMVersion.query.filter_by(finished_good_id=component_id, is_active=True).first()
-    if not active_version:
-        return {component_id: qty_needed}
-
-    child_visited = visited | {component_id}
-    totals = {}
-    for row in active_version.components:
-        comp = InternalProduct.query.get(row.component_id)
-        comp_unit = str(comp.unit_of_measure).lower() if comp and comp.unit_of_measure else "pieces"
-        multiplier = UNIT_MULTIPLIER.get(comp_unit, 1)
-        sub_qty = (row.quantity_required * multiplier) * qty_needed
-
-        sub_totals = _explode_component(row.component_id, sub_qty, child_visited, depth + 1)
-        for k, v in sub_totals.items():
-            totals[k] = totals.get(k, 0) + v
-    return totals
-
-
 @recipes_bp.route('/explode', methods=['POST'])
 @jwt_required
 def explode_orders():
@@ -234,22 +200,13 @@ def explode_orders():
         fg_id = order.get('product_id')
         order_qty = order.get('quantity', 0)
 
-        active_version = BOMVersion.query.filter_by(finished_good_id=fg_id, is_active=True).first()
-        if not active_version:
-            continue
-
         try:
-            for row in active_version.components:
-                comp = InternalProduct.query.get(row.component_id)
-                comp_unit = str(comp.unit_of_measure).lower() if comp and comp.unit_of_measure else "pieces"
-                multiplier = UNIT_MULTIPLIER.get(comp_unit, 1)
-                sub_qty = (row.quantity_required * multiplier) * order_qty
-
-                sub_totals = _explode_component(row.component_id, sub_qty, {fg_id}, 1)
-                for k, v in sub_totals.items():
-                    raw_materials_needed[k] = raw_materials_needed.get(k, 0) + v
+            sub_totals = explode_product_quantity(fg_id, order_qty)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+
+        for k, v in sub_totals.items():
+            raw_materials_needed[k] = raw_materials_needed.get(k, 0) + v
 
     result = []
     for comp_id, total_qty in raw_materials_needed.items():

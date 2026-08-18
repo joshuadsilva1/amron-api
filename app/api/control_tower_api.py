@@ -8,6 +8,7 @@ from app.models.production import DailyProductionPlan
 from app.models.qc_template import QCInspection
 from app.models.supplier_order import SupplierOrder, SupplierOrderItem
 from app.core.decorators import jwt_required
+from app.core.mrp import compute_shortages
 
 control_tower_bp = Blueprint('control_tower', __name__)
 
@@ -60,11 +61,11 @@ def get_summary():
     production_completed_today = sum(p.completed_quantity or 0 for p in todays_plans)
     production_pending_today = max(0, production_planned_today - production_completed_today)
 
-    # Material shortages: items at/below reorder level
-    material_shortages = InternalProduct.query.filter(
-        InternalProduct.reorder_level > 0,
-        InternalProduct.current_stock <= InternalProduct.reorder_level
-    ).count()
+    # Material shortages: BOM-aware MRP shortage count — demand exploded
+    # from every open PO's remaining quantity, netted against stock,
+    # safety stock, and incoming supplier orders (not just a flat
+    # reorder-level check, which ignores what's actually been ordered).
+    material_shortages = sum(1 for row in compute_shortages().values() if row['shortage'] > 0)
 
     # Quality holds: outstanding rejected inspections (no resolve/lift
     # workflow exists yet, so "rejected" is the closest available signal)
