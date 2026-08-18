@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from app import db
-from app.models.order import PurchaseOrder, POLineItem
+from app.models.order import PurchaseOrder, POLineItem, PO_STATUS_PIPELINE
 from app.models.item import InternalProduct, OEMCompanyCode
 from app.models.client import Client
 from sqlalchemy import func
@@ -58,6 +58,7 @@ def list_orders():
             "internal_product_name": product.name,
             "category": product.category,
             "quantity": line_item.quantity,
+            "produced_qty": line_item.produced_qty or 0,
             "dispatched_qty": line_item.dispatched_qty,
         })
 
@@ -154,6 +155,88 @@ def create_po():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+@orders_bp.route('/statuses', methods=['GET'], strict_slashes=False)
+@jwt_required
+def get_status_pipeline():
+    return jsonify({"status": "success", "statuses": PO_STATUS_PIPELINE}), 200
+
+
+@orders_bp.route('/<po_id>/status', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def update_po_status(po_id):
+    """Moves a PO to a new stage in PO_STATUS_PIPELINE. Not restricted to
+    the next sequential stage — manufacturing reality sometimes needs a
+    manual correction backwards (e.g. a QC reject sending it back to
+    In Production), so any valid pipeline stage is accepted."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    po = PurchaseOrder.query.get(po_id)
+    if not po:
+        return jsonify({"error": "PO not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    new_status = data.get('status')
+    if new_status not in PO_STATUS_PIPELINE:
+        return jsonify({"error": f"status must be one of {PO_STATUS_PIPELINE}"}), 400
+
+    po.status = new_status
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "po_id": po.id, "new_status": po.status}), 200
+
+
+@orders_bp.route('/line-items/<line_item_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def update_line_item_progress(line_item_id):
+    """Updates a line item's production/dispatch progress independently of
+    the parent PO's overall status — one PO can have one line fully done
+    and another still short."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    line_item = POLineItem.query.get(line_item_id)
+    if not line_item:
+        return jsonify({"error": "Line item not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+
+    if 'produced_qty' in data:
+        try:
+            produced_qty = int(data['produced_qty'])
+        except (TypeError, ValueError):
+            return jsonify({"error": "produced_qty must be a number"}), 400
+        if produced_qty < 0 or produced_qty > line_item.quantity:
+            return jsonify({"error": f"produced_qty must be between 0 and {line_item.quantity}"}), 400
+        line_item.produced_qty = produced_qty
+
+    if 'dispatched_qty' in data:
+        try:
+            dispatched_qty = int(data['dispatched_qty'])
+        except (TypeError, ValueError):
+            return jsonify({"error": "dispatched_qty must be a number"}), 400
+        if dispatched_qty < 0 or dispatched_qty > line_item.quantity:
+            return jsonify({"error": f"dispatched_qty must be between 0 and {line_item.quantity}"}), 400
+        line_item.dispatched_qty = dispatched_qty
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "status": "success",
+        "line_item_id": line_item.id,
+        "produced_qty": line_item.produced_qty,
+        "dispatched_qty": line_item.dispatched_qty,
+    }), 200
+
 
 @orders_bp.route('/clubbed', methods=['GET'], strict_slashes=False)
 @jwt_required

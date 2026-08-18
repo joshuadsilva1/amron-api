@@ -62,6 +62,7 @@ def create_app():
     from app.api.whatsapp_api import whatsapp_bp
     from app.api.chat_api import chat_bp
     from app.api.box_api import box_bp
+    from app.api.control_tower_api import control_tower_bp
 
 
     app.register_blueprint(racks_bp, url_prefix='/api/racks')
@@ -85,6 +86,7 @@ def create_app():
     app.register_blueprint(whatsapp_bp, url_prefix='/api/whatsapp')
     app.register_blueprint(chat_bp, url_prefix='/api/chat')
     app.register_blueprint(box_bp, url_prefix='/api/boxes')
+    app.register_blueprint(control_tower_bp, url_prefix='/api/control-tower')
 
     # Serve uploaded bill/chalan images
     uploads_root = os.path.join(app.root_path, '..', 'uploads')

@@ -2,14 +2,30 @@ from app import db
 from app.core.utils import generate_uuid
 from datetime import datetime
 
+# The real PO lifecycle (was previously just "Pending/Clubbed/In_Production/
+# Dispatched", and nothing anywhere ever actually moved a PO out of the
+# default "Pending" state). Order matters — it's used to render the
+# Control Tower's progress indicator.
+PO_STATUS_PIPELINE = [
+    'Received',
+    'Verified',
+    'Planned',
+    'Material Check',
+    'In Production',
+    'QC',
+    'Packing',
+    'Dispatched',
+    'Closed',
+]
+
 class PurchaseOrder(db.Model):
     """Incoming Customer POs"""
     __tablename__ = 'purchase_orders'
-    
+
     id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
     client_id = db.Column(db.String(36), db.ForeignKey('clients.id'), nullable=False)
-    
-    status = db.Column(db.String(50), default='Pending') # Pending, Clubbed, In_Production, Dispatched
+
+    status = db.Column(db.String(50), default='Received')
     notes = db.Column(db.Text)
     challan_number = db.Column(db.String(100))
     
@@ -35,4 +51,5 @@ class POLineItem(db.Model):
     mapping_id = db.Column(db.String(36), db.ForeignKey('oem_company_codes.id'), nullable=False)
     
     quantity = db.Column(db.Integer, nullable=False)
+    produced_qty = db.Column(db.Integer, default=0)
     dispatched_qty = db.Column(db.Integer, default=0)
