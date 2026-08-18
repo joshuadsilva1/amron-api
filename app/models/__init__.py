@@ -1,7 +1,7 @@
 from .client import Client
 from .supplier import Supplier
 from .item import InternalProduct, OEMCompanyCode, BoxMapping
-from .recipe import ProductBOM
+from .recipe import ProductBOM, BOMVersion
 from .order import PurchaseOrder, POLineItem
 from .supplier_order import SupplierOrder, SupplierOrderItem
 
