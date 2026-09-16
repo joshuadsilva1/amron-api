@@ -13,9 +13,6 @@ from flask_cors import CORS
 app = create_app()
 CORS(app)
 
-with app.app_context():
-    db.create_all()
-
 if __name__ == '__main__':
     # Defaults to on (unchanged local-dev behavior — the reloader is what
     # made hot-reload work). Set FLASK_DEBUG=0 before any real deployment:
@@ -24,4 +21,8 @@ if __name__ == '__main__':
     # Belt-and-suspenders: Render auto-injects RENDER=true on every service,
     # so debug is forced off there even if FLASK_DEBUG isn't set explicitly.
     debug = os.getenv('FLASK_DEBUG', '1') == '1' and not os.getenv('RENDER')
+
+    with app.app_context():
+        db.create_all()
+
     app.run(host='0.0.0.0', port=5000, debug=debug)
