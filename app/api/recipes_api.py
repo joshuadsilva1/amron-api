@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, g
 from app import db
 from app.models.recipe import ProductBOM, BOMVersion
 from app.models.item import InternalProduct
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required, user_has_permission
 from app.core.bom import explode_product_quantity
 from sqlalchemy import func
 
@@ -21,6 +21,8 @@ def _serialize_components(bom_version):
             "component_name": comp.name if comp else None,
             "quantity_required": b.quantity_required,
             "lazer_needed": b.lazer_needed,
+            "colour_needed": b.colour_needed,
+            "wastage_percent": b.wastage_percent,
             "has_sub_recipe": has_sub_recipe,
         })
     return components
@@ -55,6 +57,7 @@ def list_recipes():
 
 @recipes_bp.route('/', methods=['POST'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_recipes')
 def create_recipe():
     """
     Creates a NEW VERSION of an item's BOM — never overwrites history.
@@ -64,10 +67,19 @@ def create_recipe():
       "finished_good_id": "...",
       "notes": "...",              # optional, why this revision was made
       "components": [
-         {"component_id": "...", "quantity_required": 5, "lazer_needed": false},
+         {"component_id": "...", "quantity_required": 5, "lazer_needed": false,
+          "colour_needed": false, "wastage_percent": 10},   # wastage_percent: Admin only, see below
          ...
       ]
     }
+
+    wastage_percent is admin-only (manage_wastage permission) since it's a
+    factory-wide judgment call, not a per-recipe-edit one, and it varies
+    over time (e.g. 10% today, 12% next quarter). A non-admin saving a new
+    version simply carries forward whatever wastage_percent the component
+    already had on the previous active version (0 if it's new) — they can
+    still edit quantity_required/lazer_needed/colour_needed freely, they
+    just can't touch the wastage number.
     """
     data = request.get_json()
 
@@ -86,6 +98,12 @@ def create_recipe():
         cid = comp.get('component_id') or comp.get('input_item_id')
         if cid == finished_good_id:
             return jsonify({"error": "A recipe cannot include itself as a component"}), 400
+
+    can_edit_wastage = user_has_permission(g.current_user, 'manage_wastage')
+
+    # Carry-forward map for wastage_percent: {component_id: last active value}
+    prior_version = BOMVersion.query.filter_by(finished_good_id=finished_good_id, is_active=True).first()
+    prior_wastage = {row.component_id: row.wastage_percent for row in prior_version.components} if prior_version else {}
 
     last_version = db.session.query(func.max(BOMVersion.version)).filter_by(
         finished_good_id=finished_good_id
@@ -108,6 +126,19 @@ def create_recipe():
         component_id = comp.get('component_id') or comp.get('input_item_id')
         qty = float(comp.get('quantity_required', 0))
         lazer_needed = bool(comp.get('lazer_needed', False))
+        colour_needed = bool(comp.get('colour_needed', False))
+
+        carried_forward = prior_wastage.get(component_id, 0.0)
+        if 'wastage_percent' in comp:
+            requested_wastage = float(comp.get('wastage_percent') or 0)
+            if requested_wastage != carried_forward and not can_edit_wastage:
+                db.session.rollback()
+                return jsonify({
+                    "error": f"wastage_percent can only be changed by an Admin (component {component_id})."
+                }), 403
+            wastage_percent = requested_wastage
+        else:
+            wastage_percent = carried_forward
 
         if not component_id:
             db.session.rollback()
@@ -125,7 +156,9 @@ def create_recipe():
             bom_version_id=new_version.id,
             component_id=component_id,
             quantity_required=qty,
-            lazer_needed=lazer_needed
+            lazer_needed=lazer_needed,
+            colour_needed=colour_needed,
+            wastage_percent=wastage_percent,
         ))
 
     try:

@@ -15,3 +15,4 @@ from .adjustment import InventoryAdjustment
 from .qc_template import QCTemplate, QCSection, QCCheckpoint, QCInspection, QCObservation
 from .whatsapp import WhatsAppConfig
 from .chat import ChatChannel, ChatChannelMember, ChatMessage
+from .department_po import DepartmentPO, DepartmentPOItem

@@ -102,3 +102,34 @@ def jwt_required(f):
         return f(*args, **kwargs)
 
     return decorated
+
+
+def user_has_permission(user, permission_name):
+    """True if `user`'s role carries `permission_name` or the '*' wildcard
+    (ADMIN, per seed.py). Safe to call on a role-less/pending user."""
+    if not user or not user.role_data:
+        return False
+    perm_names = {p.name for p in user.role_data.permissions}
+    return '*' in perm_names or permission_name in perm_names
+
+
+def permission_required(*permission_names):
+    """Gate a route behind one of `permission_names` (any current user
+    permission matching ANY of them passes). Must sit under @jwt_required
+    so g.current_user is already set. The '*' wildcard (ADMIN) always
+    passes, matching user_has_permission."""
+    def wrapper(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if request.method == 'OPTIONS':
+                return jsonify({}), 200
+
+            user = getattr(g, 'current_user', None)
+            if not any(user_has_permission(user, name) for name in permission_names):
+                return jsonify({"message": "Permission denied"}), 403
+
+            return f(*args, **kwargs)
+
+        return decorated
+
+    return wrapper

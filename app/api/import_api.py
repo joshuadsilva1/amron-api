@@ -9,6 +9,25 @@ from app.core.decorators import jwt_required
 
 import_bp = Blueprint('import_api', __name__)
 
+ALLOWED_UNITS = {'pcs', 'gross', 'dozen', 'kg', 'gram', 'box', 'carton', 'set', 'roll', 'pair'}
+
+def _clean_str(value, default=''):
+    s = str(value).strip()
+    return s if s and s.lower() != 'nan' else default
+
+def _clean_float(value, default=None):
+    s = str(value).strip()
+    if not s or s.lower() == 'nan':
+        return default
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return default
+
+def _clean_int(value, default=None):
+    f = _clean_float(value, default=None)
+    return int(f) if f is not None else default
+
 def _read_uploaded_excel():
     """Pulls the uploaded file out of the request and parses it. Returns
     (dataframe, None) on success or (None, (response, status)) on failure."""
@@ -55,32 +74,62 @@ def import_excel(module_type):
 
     for index, row in df.iterrows():
         try:
-            code = str(row.get('CODE', row.get('code', row.get('CODE ', '')))).strip()
-            name = str(row.get('DECCRPTION', row.get('name', row.get('description', '')))).strip()
-            material = str(row.get('MATERIAL', row.get('material', ''))).strip()
+            code = _clean_str(row.get('CODE', row.get('code', row.get('CODE ', ''))))
+            name = _clean_str(row.get('DECCRPTION', row.get('DESCRIPTION', row.get('name', row.get('description', '')))))
+            material = _clean_str(row.get('MATERIAL', row.get('material', '')))
 
-            if not code or code == 'nan' or code == '':
+            if not code:
                 continue
+
+            # Optional enrichment columns — any of these left blank just
+            # keep the model default (create) or the existing value (update).
+            unit_raw = _clean_str(row.get('UNIT', row.get('unit', row.get('UNIT_OF_MEASURE', '')))).lower()
+            unit = unit_raw if unit_raw in ALLOWED_UNITS else None
+            price = _clean_float(row.get('PRICE', row.get('price', None)))
+            box_qty = _clean_int(row.get('BOX_QTY', row.get('box_qty', None)))
+            carton_qty = _clean_int(row.get('CARTON_QTY', row.get('carton_qty', None)))
+            pcs_per_scan = _clean_int(row.get('PCS_PER_SCAN', row.get('pcs_per_scan', None)))
+            reorder_level = _clean_float(row.get('REORDER_LEVEL', row.get('reorder_level', None)))
+            oem_company_code = _clean_str(row.get('OEM_COMPANY_CODE', row.get('oem_company_code', '')), default=None)
 
             category = code.split()[0] if ' ' in code else 'General'
 
             item = InternalProduct.query.filter_by(item_code=code).first()
             if item:
-                item.name = name if name != 'nan' else item.name
+                item.name = name if name else item.name
                 item.category = category
-                item.subcategory = material if material != 'nan' else item.subcategory
+                item.subcategory = material if material else item.subcategory
                 if department:
                     item.department_id = department.id
+                if unit is not None:
+                    item.unit_of_measure = unit
+                if price is not None:
+                    item.price = price
+                if box_qty is not None:
+                    item.box_qty = box_qty
+                if carton_qty is not None:
+                    item.carton_qty = carton_qty
+                if pcs_per_scan is not None:
+                    item.pcs_per_scan = pcs_per_scan
+                if reorder_level is not None:
+                    item.reorder_level = reorder_level
+                if oem_company_code:
+                    item.oem_company_code = oem_company_code
             else:
-                new_item = InternalProduct(
+                db.session.add(InternalProduct(
                     item_code=code,
-                    name=name if name != 'nan' else 'Unnamed Item',
+                    name=name if name else 'Unnamed Item',
                     category=category,
-                    subcategory=material if material != 'nan' else '',
+                    subcategory=material,
                     department_id=department.id if department else None,
-                    unit_of_measure='pcs'
-                )
-                db.session.add(new_item)
+                    unit_of_measure=unit or 'pcs',
+                    price=price if price is not None else 0.0,
+                    box_qty=box_qty if box_qty is not None else 0,
+                    carton_qty=carton_qty if carton_qty is not None else 0,
+                    pcs_per_scan=pcs_per_scan if pcs_per_scan is not None else 1,
+                    reorder_level=reorder_level if reorder_level is not None else 0.0,
+                    oem_company_code=oem_company_code
+                ))
             success_count += 1
         except Exception as row_err:
             errors.append(f"Row {index+1}: {str(row_err)}")

@@ -45,3 +45,17 @@ class ProductBOM(db.Model):
 
     quantity_required = db.Column(db.Float, nullable=False)
     lazer_needed = db.Column(db.Boolean, default=False)
+
+    # Does this component (as used in THIS recipe) need to pass through
+    # the Colour department before it's usable downstream? e.g. black/grey
+    # moulded parts do, white ones don't — same per-edge shape as
+    # lazer_needed since the same base component can be finished
+    # differently depending on which parent recipe it's used in.
+    colour_needed = db.Column(db.Boolean, default=False)
+
+    # Extra % of quantity_required to demand beyond the exact BOM math, to
+    # cover real-world loss (e.g. powder spillage during moulding). Varies
+    # by material and changes over time, so it's a per-row admin-only
+    # setting rather than a hardcoded constant — see manage_wastage
+    # permission in recipes_api.create_recipe.
+    wastage_percent = db.Column(db.Float, default=0.0, nullable=False)

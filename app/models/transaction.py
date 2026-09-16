@@ -36,10 +36,24 @@ class InternalChallan(db.Model):
     po_id = db.Column(db.String(36), db.ForeignKey('purchase_orders.id'), nullable=True)
     supplier_id = db.Column(db.String(36), db.ForeignKey('suppliers.id'), nullable=True)
     
+    # 'Draft' (auto-generated, stock not yet moved — e.g. a Lazer/Colour
+    # leg raised automatically when production finishes on a flagged
+    # component) -> 'Pending_Verification' (stock moved, awaiting the
+    # receiving department's photo proof) -> 'Verified'.
     status = db.Column(db.String(50), default='Pending_Verification')
     chalan_image_url = db.Column(db.String(255))
-    
-    created_by = db.Column(db.String(100)) 
+
+    # Lorry Receipt number — only relevant when the movement actually
+    # involves a vehicle/transporter (e.g. between sites). Left blank for
+    # in-premises department-to-department transfers.
+    lr_number = db.Column(db.String(100), nullable=True)
+
+    # True for challans the system raised on its own (e.g. from a
+    # lazer_needed/colour_needed recipe flag at production time) rather
+    # than a person filling out the transfer form.
+    auto_generated = db.Column(db.Boolean, default=False)
+
+    created_by = db.Column(db.String(100))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     # These relationships let you easily pull the department names later

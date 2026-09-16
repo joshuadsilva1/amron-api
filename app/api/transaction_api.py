@@ -682,16 +682,71 @@ from app.models.item import InternalProduct, DepartmentStock
 from app.models.transaction import ChallanItem
 # Make sure InternalChallan and ChallanItem are imported here too!
 
+def _execute_stock_leg(item_id, qty_to_move, from_department_id, to_department_id, challan, created_by):
+    """Moves one line item's quantity between two department stock pools
+    for an already-created challan, with the same locking/insufficient-
+    stock safety net used everywhere else stock moves. Does NOT create the
+    ChallanItem row — generate_challan creates one fresh per line, while
+    dispatch_challan is moving stock for a ChallanItem that already exists
+    from when the draft was raised. Returns an error (message, status_code)
+    tuple on failure, or None on success — caller is responsible for
+    rollback on failure and commit on success."""
+    if qty_to_move <= 0:
+        return ("Quantity must be greater than zero", 400)
+
+    sender_stock = DepartmentStock.query.filter_by(
+        item_id=item_id, department_id=from_department_id
+    ).with_for_update().first()
+
+    if not sender_stock or sender_stock.quantity < qty_to_move:
+        item_info = InternalProduct.query.get(item_id)
+        item_name = item_info.name if item_info else "Unknown Item"
+        return (
+            f"Insufficient stock. Department only has {sender_stock.quantity if sender_stock else 0} of {item_name}.",
+            400,
+        )
+
+    sender_stock.quantity -= qty_to_move
+
+    receiver_stock = DepartmentStock.query.filter_by(
+        item_id=item_id, department_id=to_department_id
+    ).first()
+    if receiver_stock:
+        receiver_stock.quantity += qty_to_move
+    else:
+        receiver_stock = DepartmentStock(item_id=item_id, department_id=to_department_id, quantity=qty_to_move)
+        db.session.add(receiver_stock)
+
+    db.session.add(StockTransaction(
+        product_id=item_id, department_id=from_department_id, transaction_type='OUT',
+        quantity=qty_to_move, challan_id=challan.id, is_manual=0,
+        reason='Internal Transfer', reference_number=challan.challan_number,
+        created_by=created_by
+    ))
+    db.session.add(StockTransaction(
+        product_id=item_id, department_id=to_department_id, transaction_type='IN',
+        quantity=qty_to_move, challan_id=challan.id, is_manual=0,
+        reason='Internal Transfer', reference_number=challan.challan_number,
+        created_by=created_by
+    ))
+
+    item_for_alert = InternalProduct.query.get(item_id)
+    if item_for_alert:
+        check_low_stock(item_for_alert, from_department_id)
+
+    return None
+
+
 @transactions_bp.route('/challan', methods=['POST'])
 @jwt_required
 def generate_challan():
     data = request.get_json()
-    
+
     from_department_id = data.get('from_department_id')
     to_department_id = data.get('to_department_id')
     movement_type = data.get('movement_type', 'Internal')
     items = data.get('items', []) # Expecting a list: [{"item_id": "...", "quantity": 50}]
-    
+
     if not all([from_department_id, to_department_id]) or not items:
         return jsonify({"error": "Origin, destination, and at least one item are required"}), 400
 
@@ -701,7 +756,7 @@ def generate_challan():
         to_department_id=to_department_id,
         is_active=1
     ).first()
-    
+
     if not valid_route:
         return jsonify({"error": "Transaction Blocked: Unauthorized route."}), 403
 
@@ -715,68 +770,23 @@ def generate_challan():
         movement_type=movement_type,
         from_department_id=from_department_id,
         to_department_id=to_department_id,
+        lr_number=data.get('lr_number'),
         created_by=data.get('user_name', 'System')
     )
     db.session.add(new_challan)
     db.session.flush() # Gets the new_challan.id without permanently committing yet
 
     # 3. THE INVENTORY SAFETY CHECK & TRANSFER
+    created_by = data.get('user_name', 'System')
     for line_item in items:
         item_id = line_item.get('item_id')
         qty_to_move = float(line_item.get('quantity', 0))
-        
-        if qty_to_move <= 0:
+
+        err = _execute_stock_leg(item_id, qty_to_move, from_department_id, to_department_id, new_challan, created_by)
+        if err:
             db.session.rollback()
-            return jsonify({"error": "Quantity must be greater than zero"}), 400
-
-        # Check sender's stock
-        sender_stock = DepartmentStock.query.filter_by(
-            item_id=item_id, department_id=from_department_id
-        ).with_for_update().first() # with_for_update() locks the row so two quick scans don't double-spend
-
-        if not sender_stock or sender_stock.quantity < qty_to_move:
-            db.session.rollback()
-            item_info = InternalProduct.query.get(item_id)
-            item_name = item_info.name if item_info else "Unknown Item"
-            return jsonify({
-                "error": f"Insufficient stock. Department only has {sender_stock.quantity if sender_stock else 0} of {item_name}."
-            }), 400
-
-        # Deduct from sender
-        sender_stock.quantity -= qty_to_move
-
-        # Add to receiver
-        receiver_stock = DepartmentStock.query.filter_by(
-            item_id=item_id, department_id=to_department_id
-        ).first()
-        
-        if receiver_stock:
-            receiver_stock.quantity += qty_to_move
-        else:
-            receiver_stock = DepartmentStock(item_id=item_id, department_id=to_department_id, quantity=qty_to_move)
-            db.session.add(receiver_stock)
-
-        # Log the line item on the challan
-        new_challan_item = ChallanItem(challan_id=new_challan.id, item_id=item_id, quantity=qty_to_move)
-        db.session.add(new_challan_item)
-
-        # Audit trail — one leg out of the sender, one leg into the receiver
-        db.session.add(StockTransaction(
-            product_id=item_id, department_id=from_department_id, transaction_type='OUT',
-            quantity=qty_to_move, challan_id=new_challan.id, is_manual=0,
-            reason='Internal Transfer', reference_number=challan_num,
-            created_by=data.get('user_name', 'System')
-        ))
-        db.session.add(StockTransaction(
-            product_id=item_id, department_id=to_department_id, transaction_type='IN',
-            quantity=qty_to_move, challan_id=new_challan.id, is_manual=0,
-            reason='Internal Transfer', reference_number=challan_num,
-            created_by=data.get('user_name', 'System')
-        ))
-
-        item_for_alert = InternalProduct.query.get(item_id)
-        if item_for_alert:
-            check_low_stock(item_for_alert, from_department_id)
+            return jsonify({"error": err[0]}), err[1]
+        db.session.add(ChallanItem(challan_id=new_challan.id, item_id=item_id, quantity=qty_to_move))
 
     # 4. COMMIT EVERYTHING
     try:
@@ -789,6 +799,113 @@ def generate_challan():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+@transactions_bp.route('/challan/drafts', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def list_draft_challans():
+    """Auto-generated challans (e.g. a Lazer/Colour leg raised when
+    production finished on a flagged component) that are sitting in
+    'Draft' — stock hasn't moved yet, they're waiting for the SENDING
+    department to actually hand the material over and dispatch it.
+    Filter with ?department_id= to see only a given department's
+    outgoing drafts (the ones it's responsible for acting on)."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    department_id = request.args.get('department_id')
+    query = InternalChallan.query.filter_by(status='Draft')
+    if department_id:
+        query = query.filter_by(from_department_id=department_id)
+
+    challans = query.order_by(InternalChallan.created_at.desc()).all()
+
+    result = []
+    for c in challans:
+        from_dept = Department.query.get(c.from_department_id)
+        to_dept = Department.query.get(c.to_department_id)
+        items = ChallanItem.query.filter_by(challan_id=c.id).all()
+        item_list = []
+        for it in items:
+            product = InternalProduct.query.get(it.item_id)
+            item_list.append({
+                "item_id": it.item_id,
+                "item_name": product.name if product else "Unknown Item",
+                "item_code": product.item_code if product else None,
+                "quantity": it.quantity,
+            })
+        result.append({
+            "id": c.id,
+            "challan_number": c.challan_number,
+            "movement_type": c.movement_type,
+            "from_department_id": c.from_department_id,
+            "from_department_name": from_dept.name if from_dept else "Unknown",
+            "to_department_id": c.to_department_id,
+            "to_department_name": to_dept.name if to_dept else "Unknown",
+            "auto_generated": c.auto_generated,
+            "created_at": c.created_at.isoformat(),
+            "items": item_list,
+        })
+
+    return jsonify({"status": "success", "data": result}), 200
+
+
+@transactions_bp.route('/challan/<challan_id>/dispatch', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def dispatch_challan(challan_id):
+    """Turns a 'Draft' challan into an actual movement: moves the stock
+    between the two department pools (same safety net as generate_challan
+    — insufficient stock or a since-revoked route both block it) and
+    advances status to 'Pending_Verification', same as a manually-created
+    challan. This is the step that should happen when the material
+    physically leaves the sending department — not before."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+
+    challan = InternalChallan.query.get(challan_id)
+    if not challan:
+        return jsonify({"error": "Challan not found"}), 404
+
+    if challan.status != 'Draft':
+        return jsonify({"error": f"Only a Draft challan can be dispatched (this one is '{challan.status}')."}), 400
+
+    valid_route = DepartmentRoute.query.filter_by(
+        from_department_id=challan.from_department_id,
+        to_department_id=challan.to_department_id,
+        is_active=1
+    ).first()
+    if not valid_route:
+        return jsonify({"error": "Transaction Blocked: Unauthorized route. Ask an Admin to approve this department route first."}), 403
+
+    created_by = data.get('user_name', 'System')
+    for line_item in ChallanItem.query.filter_by(challan_id=challan.id).all():
+        err = _execute_stock_leg(
+            line_item.item_id, line_item.quantity,
+            challan.from_department_id, challan.to_department_id,
+            challan, created_by
+        )
+        if err:
+            db.session.rollback()
+            return jsonify({"error": err[0]}), err[1]
+
+    if data.get('lr_number'):
+        challan.lr_number = data['lr_number']
+    challan.status = 'Pending_Verification'
+
+    try:
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "message": "Challan dispatched — stock moved.",
+            "challan_number": challan.challan_number,
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
 @transactions_bp.route('/challan/verify', methods=['PUT'])
 @jwt_required
 def verify_challan():
@@ -819,7 +936,8 @@ def verify_challan():
         return jsonify({"error": str(e)}), 500
 
 # Add this to your imports at the top
-from app.models.recipe import ProductBOM
+from app.models.recipe import ProductBOM, BOMVersion
+from app.core.department_po import apply_production_to_department_pos
 
 @transactions_bp.route('/produce', methods=['POST'])
 @jwt_required
@@ -841,8 +959,12 @@ def log_production():
     except ValueError:
         return jsonify({"error": "Quantity must be a number"}), 400
 
-    # 1. Verify the recipe (BOM) exists — built via the Recipe (BOM) Builder screen
-    bom_rows = ProductBOM.query.filter_by(finished_good_id=item_id).all()
+    # 1. Verify the recipe (BOM) exists — built via the Recipe (BOM) Builder screen.
+    # finished_good_id lives on BOMVersion, not ProductBOM directly — go
+    # through the item's ACTIVE version only, same as everywhere else
+    # (core/bom.py, recipes_api) reads a recipe.
+    active_bom_version = BOMVersion.query.filter_by(finished_good_id=item_id, is_active=True).first()
+    bom_rows = active_bom_version.components if active_bom_version else []
     if not bom_rows:
         return jsonify({"error": "No recipe found for this item. Cannot manufacture."}), 404
 
@@ -918,13 +1040,69 @@ def log_production():
         created_by=data.get('user_name', 'Production Log')
     ))
 
-    # 6. COMMIT TRANSACTION
+    # 5b. CREDIT ANY OPEN INTERNAL DEPARTMENT PO — this is the ONLY way a
+    # DepartmentPO ever moves off 'Pending'/'In_Progress' toward
+    # 'Fulfilled'. There's no separate manual "approve" step; logging real
+    # production against it IS the approval.
+    fulfilled_department_pos = apply_production_to_department_pos(department_id, item_id, quantity_produced)
+
+    # 6. AUTO-DRAFT DOWNSTREAM PROCESS CHALLANS — this item may itself be
+    # used as a flagged component somewhere else's recipe (e.g. a black
+    # moulded body used in the switch recipe with colour_needed=True).
+    # If so, raise a Draft challan straight to that process department so
+    # nobody has to remember to do it by hand. Stock does NOT move yet —
+    # dispatch_challan does that once the material actually leaves.
+    drafted_challans = []
+    flagged_edges = ProductBOM.query.join(
+        BOMVersion, ProductBOM.bom_version_id == BOMVersion.id
+    ).filter(
+        ProductBOM.component_id == item_id,
+        BOMVersion.is_active == True,
+        db.or_(ProductBOM.lazer_needed == True, ProductBOM.colour_needed == True)
+    ).all()
+
+    processes_needed = set()
+    for edge in flagged_edges:
+        if edge.lazer_needed:
+            processes_needed.add('Lazer')
+        if edge.colour_needed:
+            processes_needed.add('Colour')
+
+    for process_name in processes_needed:
+        target_dept = Department.query.filter(
+            db.func.lower(Department.name) == process_name.lower(), Department.is_active == 1
+        ).first()
+        if not target_dept or target_dept.id == department_id:
+            continue  # no such department configured, or already produced there — nothing to draft
+
+        date_str = datetime.now().strftime("%Y%m%d")
+        unique_suffix = datetime.now().strftime("%H%M%S%f")
+        draft_challan = InternalChallan(
+            challan_number=f"CH-{date_str}-{unique_suffix}-{process_name[:3].upper()}",
+            movement_type=f"{process_name} Process",
+            from_department_id=department_id,
+            to_department_id=target_dept.id,
+            status='Draft',
+            auto_generated=True,
+            created_by='System (Auto-Draft)'
+        )
+        db.session.add(draft_challan)
+        db.session.flush()
+        db.session.add(ChallanItem(challan_id=draft_challan.id, item_id=item_id, quantity=quantity_produced))
+        drafted_challans.append({
+            "challan_number": draft_challan.challan_number,
+            "to_department": target_dept.name,
+        })
+
+    # 7. COMMIT TRANSACTION
     try:
         db.session.commit()
         return jsonify({
             "status": "success",
             "message": f"Successfully manufactured {quantity_produced} units of {fg_item.name}.",
-            "raw_materials_consumed": len(bom_rows)
+            "raw_materials_consumed": len(bom_rows),
+            "drafted_challans": drafted_challans,
+            "fulfilled_department_pos": fulfilled_department_pos,
         }), 201
     except Exception as e:
         db.session.rollback()

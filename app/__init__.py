@@ -64,6 +64,8 @@ def create_app():
     from app.api.box_api import box_bp
     from app.api.control_tower_api import control_tower_bp
     from app.api.mrp_api import mrp_bp
+    from app.api.labels_api import labels_bp
+    from app.api.department_po_api import department_po_bp
 
 
     app.register_blueprint(racks_bp, url_prefix='/api/racks')
@@ -89,6 +91,8 @@ def create_app():
     app.register_blueprint(box_bp, url_prefix='/api/boxes')
     app.register_blueprint(control_tower_bp, url_prefix='/api/control-tower')
     app.register_blueprint(mrp_bp, url_prefix='/api/mrp')
+    app.register_blueprint(labels_bp, url_prefix='/api/labels')
+    app.register_blueprint(department_po_bp, url_prefix='/api/department-pos')
 
     # Serve uploaded bill/chalan images
     uploads_root = os.path.join(app.root_path, '..', 'uploads')

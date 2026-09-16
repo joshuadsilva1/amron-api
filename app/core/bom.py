@@ -34,7 +34,8 @@ def explode_component(component_id, qty_needed, visited, depth):
         comp = InternalProduct.query.get(row.component_id)
         comp_unit = str(comp.unit_of_measure).lower() if comp and comp.unit_of_measure else "pieces"
         multiplier = UNIT_MULTIPLIER.get(comp_unit, 1)
-        sub_qty = (row.quantity_required * multiplier) * qty_needed
+        wastage_multiplier = 1 + ((row.wastage_percent or 0) / 100)
+        sub_qty = (row.quantity_required * multiplier) * qty_needed * wastage_multiplier
 
         sub_totals = explode_component(row.component_id, sub_qty, child_visited, depth + 1)
         for k, v in sub_totals.items():
@@ -55,7 +56,8 @@ def explode_product_quantity(product_id, quantity):
         comp = InternalProduct.query.get(row.component_id)
         comp_unit = str(comp.unit_of_measure).lower() if comp and comp.unit_of_measure else "pieces"
         multiplier = UNIT_MULTIPLIER.get(comp_unit, 1)
-        sub_qty = (row.quantity_required * multiplier) * quantity
+        wastage_multiplier = 1 + ((row.wastage_percent or 0) / 100)
+        sub_qty = (row.quantity_required * multiplier) * quantity * wastage_multiplier
 
         sub_totals = explode_component(row.component_id, sub_qty, {product_id}, 1)
         for k, v in sub_totals.items():
