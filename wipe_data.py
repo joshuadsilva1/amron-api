@@ -39,7 +39,7 @@ Pick how much to delete by changing LEVEL below. Start with "transactional".
 #                     production/dispatch/transaction/QR record, chat,
 #                     notifications, audit logs, settings — is gone.
 # ---------------------------------------------------------------------------
-LEVEL = "admin_and_qc_only"
+LEVEL = "transactional"
 
 KEEP_ADMIN_PHONES = ["+919876543212", "+919372562534"]
 
