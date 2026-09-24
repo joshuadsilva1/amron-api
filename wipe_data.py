@@ -24,8 +24,24 @@ Pick how much to delete by changing LEVEL below. Start with "transactional".
 #                     roles/permissions/modules), then log in once and have
 #                     an admin assign your role. Only use if you truly want
 #                     a blank slate.
+#
+# "admin_and_qc_only" -> deletes everything except: the users listed in
+#                     KEEP_ADMIN_PHONES, the ADMIN role (+ its permissions),
+#                     an empty PENDING role (id=0 — required by the login
+#                     code's role_id default; new sign-ins would error
+#                     without it, not just land on "awaiting approval"),
+#                     the Permission catalog (harmless reference data), and
+#                     the QC checklist definitions (qc_templates/sections/
+#                     checkpoints — NOT past inspection results, which
+#                     reference items/departments that are also being
+#                     deleted). Everything else — items, departments,
+#                     recipes, suppliers, clients, racks, every order/
+#                     production/dispatch/transaction/QR record, chat,
+#                     notifications, audit logs, settings — is gone.
 # ---------------------------------------------------------------------------
-LEVEL = "transactional"
+LEVEL = "admin_and_qc_only"
+
+KEEP_ADMIN_PHONES = ["+919876543212", "+919372562534"]
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -87,6 +103,9 @@ MASTER_DATA = [
     'suppliers',
 ]
 
+# Same as MASTER_DATA but keeps the QC checklist definitions.
+MASTER_DATA_KEEP_QC = [t for t in MASTER_DATA if t not in ('qc_checkpoints', 'qc_sections', 'qc_templates')]
+
 # Never touched — this is Alembic's own bookkeeping. Wiping it would make
 # the DB look un-migrated and break `flask db upgrade`.
 NEVER_TOUCH = {'alembic_version'}
@@ -115,6 +134,38 @@ with app.app_context():
             if LEVEL == "keep_logins":
                 print('Master/config data:')
                 delete_in_order(MASTER_DATA)
+            elif LEVEL == "admin_and_qc_only":
+                print('Master/config data (keeping QC checklists):')
+                delete_in_order(MASTER_DATA_KEEP_QC)
+
+                print('App modules / settings:')
+                delete_in_order(['app_modules', 'system_settings'])
+
+                print('Users (keeping only KEEP_ADMIN_PHONES):')
+                placeholders = ', '.join(f"'{p}'" for p in KEEP_ADMIN_PHONES)
+                result = db.session.execute(text(
+                    f'DELETE FROM users WHERE phone_number NOT IN ({placeholders})'
+                ))
+                print(f'  users: deleted {result.rowcount}')
+
+                print('Roles (keeping ADMIN and an empty PENDING placeholder):')
+                result = db.session.execute(text(
+                    "DELETE FROM role_permissions WHERE role_id NOT IN "
+                    "(SELECT id FROM roles WHERE name = 'ADMIN' OR id = 0)"
+                ))
+                print(f'  role_permissions: deleted {result.rowcount}')
+                result = db.session.execute(text(
+                    "DELETE FROM roles WHERE name != 'ADMIN' AND id != 0"
+                ))
+                print(f'  roles: deleted {result.rowcount}')
+                # PENDING (id=0) is what a brand-new phone number's user row
+                # defaults role_id to on first login (see models/user.py) —
+                # if that row doesn't exist at all, a new sign-in errors
+                # outright instead of landing on "awaiting approval".
+                db.session.execute(text(
+                    "INSERT INTO roles (id, name, description) VALUES (0, 'PENDING', 'Awaiting role assignment') "
+                    "ON CONFLICT (id) DO NOTHING"
+                ))
             else:
                 # Stock levels are derived from the ledger we just cleared.
                 result = db.session.execute(text('UPDATE internal_products SET current_stock = 0'))
