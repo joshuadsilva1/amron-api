@@ -125,7 +125,7 @@ def delete_role(role_id):
 def get_all_modules():
     """Fetch all dynamic app modules"""
     modules = AppModule.query.all()
-    
+
     modules_data = []
     for m in modules:
         modules_data.append({
@@ -134,10 +134,90 @@ def get_all_modules():
             "description": m.description,
             "icon": m.icon,
             "is_active": m.is_active,
-            "route": m.route
+            "route": m.route,
+            "permission_id": m.permission_id,
+            "permission_name": m.required_permission.name if m.required_permission else None,
         })
-        
+
     return jsonify({"modules": modules_data}), 200
+
+
+@admin_bp.route('/modules', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def create_module():
+    """Creates a new nav-gating module: a (route, required permission) pair.
+    See utils/moduleAccess.ts on the frontend for how this is used — a
+    route with no module row at all stays visible to everyone, so this is
+    how an Admin opts a route INTO being gated."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    route = (data.get('route') or '').strip()
+    permission_id = data.get('permission_id')
+    icon = (data.get('icon') or 'grid').strip() or 'grid'
+    description = (data.get('description') or '').strip() or None
+
+    if not name or not route or not permission_id:
+        return jsonify({"message": "name, route, and permission_id are required"}), 400
+
+    if not route.startswith('/(protected)/'):
+        return jsonify({"message": "route should look like /(protected)/manager/items"}), 400
+
+    if not Permission.query.get(permission_id):
+        return jsonify({"message": "That permission doesn't exist"}), 404
+
+    if AppModule.query.filter_by(route=route).first():
+        return jsonify({"message": f"A module already exists for route '{route}'"}), 409
+
+    module = AppModule(
+        name=name, route=route, icon=icon, description=description,
+        permission_id=permission_id, is_active=True,
+    )
+    db.session.add(module)
+    db.session.flush()
+
+    log_audit(
+        'module.create', 'app_module', module.id,
+        payload_after={"name": name, "route": route, "permission_id": permission_id},
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Module '{name}' created", "id": module.id}), 201
+
+
+@admin_bp.route('/modules/<int:module_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def delete_module(module_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    module = AppModule.query.get(module_id)
+    if not module:
+        return jsonify({"message": "Module not found"}), 404
+
+    log_audit(
+        'module.delete', 'app_module', module_id,
+        payload_before={"name": module.name, "route": module.route},
+    )
+
+    db.session.delete(module)
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Module '{module.name}' deleted"}), 200
+
 
 @admin_bp.route('/modules/<int:module_id>/toggle', methods=['PUT'])
 @jwt_required
