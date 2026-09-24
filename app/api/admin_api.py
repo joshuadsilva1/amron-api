@@ -1,4 +1,7 @@
+import os
+import uuid
 from flask import Blueprint, jsonify, request, g
+from werkzeug.utils import secure_filename
 from app import db
 from app.models.user import User, Role
 from app.models.department import DepartmentRoute
@@ -7,9 +10,12 @@ from app.models.user import Permission
 # Assuming you have a jwt_required decorator, import it here
 from app.core.decorators import jwt_required, permission_required
 from app.core.utils import normalize_phone_number
+from app.core.storage import upload_file
 from app.models.system_setting import SystemSetting, DEFAULT_SETTINGS
 from app.models.audit_log import AuditLog
+from app.models.nav_route import NavRoute
 from app.core.audit import log_audit
+import re
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/api/admin')
 
@@ -133,6 +139,7 @@ def get_all_modules():
             "name": m.name,
             "description": m.description,
             "icon": m.icon,
+            "icon_image_url": m.icon_image_url,
             "is_active": m.is_active,
             "route": m.route,
             "permission_id": m.permission_id,
@@ -158,6 +165,7 @@ def create_module():
     route = (data.get('route') or '').strip()
     permission_id = data.get('permission_id')
     icon = (data.get('icon') or 'grid').strip() or 'grid'
+    icon_image_url = (data.get('icon_image_url') or '').strip() or None
     description = (data.get('description') or '').strip() or None
 
     if not name or not route or not permission_id:
@@ -173,7 +181,7 @@ def create_module():
         return jsonify({"message": f"A module already exists for route '{route}'"}), 409
 
     module = AppModule(
-        name=name, route=route, icon=icon, description=description,
+        name=name, route=route, icon=icon, icon_image_url=icon_image_url, description=description,
         permission_id=permission_id, is_active=True,
     )
     db.session.add(module)
@@ -191,6 +199,98 @@ def create_module():
         return jsonify({"error": str(e)}), 500
 
     return jsonify({"status": "success", "message": f"Module '{name}' created", "id": module.id}), 201
+
+
+@admin_bp.route('/modules/<int:module_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def update_module(module_id):
+    """Full edit — distinct from /toggle (which only flips is_active)."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    module = AppModule.query.get(module_id)
+    if not module:
+        return jsonify({"message": "Module not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    before = {
+        "name": module.name, "route": module.route, "icon": module.icon,
+        "icon_image_url": module.icon_image_url, "description": module.description,
+        "permission_id": module.permission_id,
+    }
+
+    if 'name' in data:
+        new_name = (data['name'] or '').strip()
+        if not new_name:
+            return jsonify({"message": "name can't be blank"}), 400
+        module.name = new_name
+    if 'route' in data:
+        new_route = (data['route'] or '').strip()
+        if not new_route.startswith('/(protected)/'):
+            return jsonify({"message": "route should look like /(protected)/manager/items"}), 400
+        existing = AppModule.query.filter(AppModule.route == new_route, AppModule.id != module_id).first()
+        if existing:
+            return jsonify({"message": f"A module already exists for route '{new_route}'"}), 409
+        module.route = new_route
+    if 'permission_id' in data:
+        if not Permission.query.get(data['permission_id']):
+            return jsonify({"message": "That permission doesn't exist"}), 404
+        module.permission_id = data['permission_id']
+    if 'icon' in data:
+        module.icon = (data['icon'] or 'grid').strip() or 'grid'
+    if 'icon_image_url' in data:
+        module.icon_image_url = (data['icon_image_url'] or '').strip() or None
+    if 'description' in data:
+        module.description = (data['description'] or '').strip() or None
+
+    log_audit(
+        'module.update', 'app_module', module_id,
+        payload_before=before,
+        payload_after={
+            "name": module.name, "route": module.route, "icon": module.icon,
+            "icon_image_url": module.icon_image_url, "description": module.description,
+            "permission_id": module.permission_id,
+        },
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Module '{module.name}' updated"}), 200
+
+
+ALLOWED_ICON_EXT = {'.png'}
+
+
+@admin_bp.route('/modules/icon-upload', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def upload_module_icon():
+    """Uploads a custom PNG to use as a module's icon in place of a named
+    Feather icon. Returns the public URL to send back as icon_image_url on
+    create/update — this endpoint doesn't touch any module row itself."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded. Expected multipart/form-data with a 'file' field."}), 400
+
+    uploaded_file = request.files['file']
+    if not uploaded_file or uploaded_file.filename == '':
+        return jsonify({"error": "No file uploaded."}), 400
+
+    ext = os.path.splitext(uploaded_file.filename)[1].lower()
+    if ext not in ALLOWED_ICON_EXT:
+        return jsonify({"error": "Only .png icons are supported."}), 400
+
+    filename = secure_filename(f"{uuid.uuid4().hex}{ext}")
+    url = upload_file(uploaded_file, 'module_icons', filename)
+
+    return jsonify({"status": "success", "url": url}), 200
 
 
 @admin_bp.route('/modules/<int:module_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
@@ -636,6 +736,261 @@ def list_audit_logs():
             "created_at": l.created_at.isoformat() if l.created_at else None,
         } for l in logs],
     }), 200
+
+
+# ==========================================
+# NAV ROUTES — human-friendly labels for frontend route paths (e.g.
+# "/(protected)/admin" -> "Admin Page"), so route pickers elsewhere in the
+# admin UI (AppModule's route field) show a name instead of a raw path.
+# Unrelated to DepartmentRoute / "Routing Editor" (physical material
+# handoff routing) despite the shared word.
+# ==========================================
+
+@admin_bp.route('/nav-routes', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def list_nav_routes():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    routes = NavRoute.query.order_by(NavRoute.label).all()
+    return jsonify({
+        "status": "success",
+        "data": [{"id": r.id, "path": r.path, "label": r.label, "description": r.description} for r in routes],
+    }), 200
+
+
+@admin_bp.route('/nav-routes', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def create_nav_route():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    path = (data.get('path') or '').strip()
+    label = (data.get('label') or '').strip()
+    description = (data.get('description') or '').strip() or None
+
+    if not path or not label:
+        return jsonify({"message": "path and label are required"}), 400
+    if not path.startswith('/'):
+        return jsonify({"message": "path should look like /(protected)/manager/items"}), 400
+    if NavRoute.query.filter_by(path=path).first():
+        return jsonify({"message": f"'{path}' already has a label"}), 409
+
+    route = NavRoute(path=path, label=label, description=description)
+    db.session.add(route)
+    db.session.flush()
+    log_audit('nav_route.create', 'nav_route', route.id, payload_after={"path": path, "label": label})
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"'{label}' added", "id": route.id}), 201
+
+
+@admin_bp.route('/nav-routes/<int:route_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def update_nav_route(route_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    route = NavRoute.query.get(route_id)
+    if not route:
+        return jsonify({"message": "Route not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    before = {"path": route.path, "label": route.label, "description": route.description}
+
+    if 'label' in data:
+        new_label = (data['label'] or '').strip()
+        if not new_label:
+            return jsonify({"message": "label can't be blank"}), 400
+        route.label = new_label
+    if 'description' in data:
+        route.description = (data['description'] or '').strip() or None
+    if 'path' in data:
+        new_path = (data['path'] or '').strip()
+        if not new_path.startswith('/'):
+            return jsonify({"message": "path should look like /(protected)/manager/items"}), 400
+        existing = NavRoute.query.filter(NavRoute.path == new_path, NavRoute.id != route_id).first()
+        if existing:
+            return jsonify({"message": f"'{new_path}' already has a label"}), 409
+        route.path = new_path
+
+    log_audit(
+        'nav_route.update', 'nav_route', route_id,
+        payload_before=before,
+        payload_after={"path": route.path, "label": route.label, "description": route.description},
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"'{route.label}' updated"}), 200
+
+
+@admin_bp.route('/nav-routes/<int:route_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def delete_nav_route(route_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    route = NavRoute.query.get(route_id)
+    if not route:
+        return jsonify({"message": "Route not found"}), 404
+
+    if AppModule.query.filter_by(route=route.path).first():
+        return jsonify({
+            "message": f"'{route.label}' is used by a module — remove or repoint that module first."
+        }), 409
+
+    log_audit('nav_route.delete', 'nav_route', route_id, payload_before={"path": route.path, "label": route.label})
+
+    db.session.delete(route)
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"'{route.label}' deleted"}), 200
+
+
+# ==========================================
+# PERMISSIONS — the building blocks Roles are made of (see admin_api's
+# roles endpoints above) and that Modules gate a route behind. A
+# permission's `name` is what `@permission_required('name')` decorators
+# check for literally throughout the backend, so renaming one after the
+# fact would silently break enforcement with no code-level trace — name is
+# therefore immutable once created; only its description can be edited.
+# ==========================================
+
+PERMISSION_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+
+
+@admin_bp.route('/permissions', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def list_permissions():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    perms = Permission.query.order_by(Permission.name).all()
+    return jsonify({
+        "status": "success",
+        "data": [{
+            "id": p.id,
+            "name": p.name,
+            "description": p.description,
+            "role_count": len(p.roles),
+        } for p in perms],
+    }), 200
+
+
+@admin_bp.route('/permissions', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def create_permission():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip().lower()
+    description = (data.get('description') or '').strip() or None
+
+    if not name:
+        return jsonify({"message": "name is required"}), 400
+    if name != '*' and not PERMISSION_NAME_RE.match(name):
+        return jsonify({"message": "name must be lowercase snake_case, e.g. manage_something"}), 400
+    if Permission.query.filter_by(name=name).first():
+        return jsonify({"message": f"Permission '{name}' already exists"}), 409
+
+    perm = Permission(name=name, description=description)
+    db.session.add(perm)
+    db.session.flush()
+    log_audit('permission.create', 'permission', perm.id, payload_after={"name": name, "description": description})
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Permission '{name}' created", "id": perm.id}), 201
+
+
+@admin_bp.route('/permissions/<int:permission_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def update_permission(permission_id):
+    """Only description is editable — see the module docstring above for why."""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    perm = Permission.query.get(permission_id)
+    if not perm:
+        return jsonify({"message": "Permission not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    before = perm.description
+    perm.description = (data.get('description') or '').strip() or None
+
+    log_audit(
+        'permission.update', 'permission', permission_id,
+        payload_before={"description": before}, payload_after={"description": perm.description},
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Permission '{perm.name}' updated"}), 200
+
+
+@admin_bp.route('/permissions/<int:permission_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def delete_permission(permission_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    perm = Permission.query.get(permission_id)
+    if not perm:
+        return jsonify({"message": "Permission not found"}), 404
+
+    if perm.name == '*':
+        return jsonify({"message": "The '*' (Admin wildcard) permission can't be deleted"}), 409
+
+    roles_using = Role.query.filter(Role.permissions.any(id=permission_id)).count()
+    if roles_using > 0:
+        return jsonify({
+            "message": f"'{perm.name}' is assigned to {roles_using} role(s) — remove it from them first."
+        }), 409
+    if AppModule.query.filter_by(permission_id=permission_id).first():
+        return jsonify({
+            "message": f"'{perm.name}' gates a module — remove or repoint that module first."
+        }), 409
+
+    log_audit('permission.delete', 'permission', permission_id, payload_before={"name": perm.name})
+
+    db.session.delete(perm)
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"Permission '{perm.name}' deleted"}), 200
 
 
 

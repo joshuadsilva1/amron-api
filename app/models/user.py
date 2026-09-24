@@ -16,7 +16,10 @@ class AppModule(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     name = db.Column(db.String(100), nullable=False)             # e.g., "Products & Recipes"
     route = db.Column(db.String(255), nullable=False)            # e.g., "/(protected)/manager/items"
-    icon = db.Column(db.String(50), default="grid")              # e.g., "box"
+    icon = db.Column(db.String(50), default="grid")              # e.g., "box" — Feather icon name, used
+                                                                    # directly if no icon_image_url, and as the
+                                                                    # fallback render if that image fails to load
+    icon_image_url = db.Column(db.String(500), nullable=True)    # optional uploaded PNG in place of icon
     description = db.Column(db.String(255))                      # e.g., "Manage BOM and items"
     
     # Link to the Permission table. A module requires a specific permission to be viewed.
@@ -39,7 +42,7 @@ class Role(db.Model):
     description = db.Column(db.String(255))
     
     # Allows you to access role.permissions easily
-    permissions = db.relationship('Permission', secondary=role_permissions, lazy='subquery')
+    permissions = db.relationship('Permission', secondary=role_permissions, lazy='subquery', backref='roles')
 
 class User(db.Model):
     __tablename__ = "users"

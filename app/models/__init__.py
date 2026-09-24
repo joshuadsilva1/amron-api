@@ -18,3 +18,4 @@ from .chat import ChatChannel, ChatChannelMember, ChatMessage
 from .department_po import DepartmentPO, DepartmentPOItem
 from .system_setting import SystemSetting
 from .audit_log import AuditLog
+from .nav_route import NavRoute
