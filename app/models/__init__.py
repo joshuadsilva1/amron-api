@@ -13,6 +13,8 @@ from .qr_code import QRCodeRegistry
 from .quality import QualityInspectionLog
 from .adjustment import InventoryAdjustment
 from .qc_template import QCTemplate, QCSection, QCCheckpoint, QCInspection, QCObservation
-from .whatsapp import WhatsAppConfig
+from .whatsapp import WhatsAppConfig, ReportSubscription
 from .chat import ChatChannel, ChatChannelMember, ChatMessage
 from .department_po import DepartmentPO, DepartmentPOItem
+from .system_setting import SystemSetting
+from .audit_log import AuditLog

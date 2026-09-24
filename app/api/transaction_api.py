@@ -7,9 +7,11 @@ from app.models.transaction import StockTransaction, InternalChallan
 from app.models.item import InternalProduct, DepartmentStock
 from app.models.department import Department
 import datetime
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 from app.core.notify import check_low_stock
 from app.core.storage import upload_file
+from app.core.audit import log_audit
+import math
 
 ALLOWED_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
 
@@ -20,6 +22,7 @@ from app.models.client import Client
 
 @transactions_bp.route('/dispatch', methods=['POST'])
 @jwt_required
+@permission_required('dispatch_goods')
 def dispatch_goods():
     data = request.get_json()
     
@@ -162,6 +165,7 @@ from app.models.adjustment import InventoryAdjustment
 
 @transactions_bp.route('/adjust', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def adjust_stock():
     """Handles manual inventory corrections (scrap, loss, audits)"""
     data = request.get_json()
@@ -277,6 +281,7 @@ from datetime import datetime
 
 @transactions_bp.route('/challan/scan', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def scanner_challan():
     """Moves physical bins (QR codes) from one department to another"""
     data = request.get_json()
@@ -402,6 +407,7 @@ def scanner_challan():
 # ==========================================
 @transactions_bp.route('/scan', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def handle_qr_scan():
     data = request.get_json()
     qr_code_string = data.get('qr_code_string')
@@ -477,16 +483,33 @@ def handle_qr_scan():
 # ==========================================
 @transactions_bp.route('/manual', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def manual_adjustment():
     data = request.get_json()
-    
+
     product_id = data.get('product_id')
     transaction_type = data.get('transaction_type')
     department_id = data.get('department_id') # Changed to expect ID
     reason = data.get('reason')
+    qr_code_string = data.get('qr_code_string')
 
     if not all([product_id, transaction_type, data.get('quantity'), department_id, reason]):
         return jsonify({"error": "Product, type, quantity, department ID, and reason are required"}), 400
+
+    # --- QC SAFETY CHECK (scan-in gate) ---
+    # The floor-worker and manager "Scan In/Out" screens go through this
+    # generic endpoint rather than /challan/scan, so this is the only
+    # server-side chokepoint for their scans. Mirrors the check in
+    # scanner_challan(): a bin that's registered in QRCodeRegistry (i.e. it
+    # went through supplier QC) cannot be scanned IN anywhere until its
+    # qc_status is 'Passed'. A code that isn't a registered bin (e.g. a
+    # plain item-master barcode with no batch/QC tracking) is unaffected.
+    if transaction_type.upper() == 'IN' and qr_code_string:
+        bin_record = QRCodeRegistry.query.filter_by(qr_code_string=qr_code_string).first()
+        if bin_record and bin_record.qc_status != 'Passed':
+            return jsonify({
+                "error": f"Transaction Blocked: This batch's QC status is '{bin_record.qc_status}'. It cannot be scanned in until QC approves it."
+            }), 403
 
     try:
         quantity = float(data.get('quantity'))
@@ -557,6 +580,7 @@ def manual_adjustment():
 
 @transactions_bp.route('/manual/<transaction_id>/photo', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def attach_manual_adjustment_photo(transaction_id):
     """Attaches a photo (e.g. the physical chalan) to an already-logged
     manual stock movement. /manual itself is plain JSON with no file
@@ -603,6 +627,7 @@ from app.models.department import Department
 
 @transactions_bp.route('/receive', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def receive_stock():
     """Receives new raw materials or stock into a specific department"""
     data = request.get_json()
@@ -739,6 +764,7 @@ def _execute_stock_leg(item_id, qty_to_move, from_department_id, to_department_i
 
 @transactions_bp.route('/challan', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def generate_challan():
     data = request.get_json()
 
@@ -852,6 +878,7 @@ def list_draft_challans():
 
 @transactions_bp.route('/challan/<challan_id>/dispatch', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def dispatch_challan(challan_id):
     """Turns a 'Draft' challan into an actual movement: moves the stock
     between the two department pools (same safety net as generate_challan
@@ -908,6 +935,7 @@ def dispatch_challan(challan_id):
 
 @transactions_bp.route('/challan/verify', methods=['PUT'])
 @jwt_required
+@permission_required('scan_inventory')
 def verify_challan():
     data = request.get_json()
     
@@ -941,6 +969,7 @@ from app.core.department_po import apply_production_to_department_pos
 
 @transactions_bp.route('/produce', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def log_production():
     """Logs the manufacturing of a product, consuming raw materials based on the BoM"""
     data = request.get_json()
@@ -1142,6 +1171,7 @@ def get_department_transactions(department_id):
 
 @transactions_bp.route('/generate-qr', methods=['POST'])
 @jwt_required
+@permission_required('scan_inventory')
 def generate_qr():
     """Mints a new QR code for a physical bin of inventory"""
     data = request.get_json()
@@ -1248,6 +1278,7 @@ def get_pending_challans():
 
 @transactions_bp.route('/challan/<challan_id>/verify', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def verify_challan_with_photo(challan_id):
     """Receiving department confirms a chalan: attach a photo of the
     counted goods and mark it Verified in one step."""
@@ -1286,6 +1317,199 @@ def verify_challan_with_photo(challan_id):
             "message": f"Challan {challan.challan_number} verified.",
             "chalan_image_url": challan.chalan_image_url,
         }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# ASSEMBLY / LIMITING-FACTOR RECONCILIATION — Dispatch combines several
+# moulding parts + a brass part into one Finished Good. If one component
+# breaks partway through, the batch can't outrun whichever component ran
+# out first (the "limiting factor"): every OTHER component that was pulled
+# for the same planned batch size but wasn't needed at the reduced output
+# gets automatically restocked, with its own ledger entry.
+# ==========================================
+
+@transactions_bp.route('/assemble', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('scan_inventory')
+def assemble_finished_good():
+    """Body: {
+      department_id, item_id (the FG being assembled), planned_quantity,
+      breakages: {component_id: broken_qty, ...}   # optional, omitted = 0
+    }
+
+    Every component in the FG's BOM is assumed pulled from department stock
+    at `planned_quantity` — i.e. the batch size the department originally
+    set out to build. `breakages` reports how many of that PULLED quantity
+    turned out damaged, per component. The actual output is capped by
+    whichever component's breakage makes it run out first; every component
+    that had more pulled than the actual output needed (and wasn't itself
+    the broken one) gets its unused surplus restocked automatically.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    department_id = data.get('department_id')
+    item_id = data.get('item_id')
+    breakages_raw = data.get('breakages') or {}
+    created_by = data.get('user_name', 'Assembly')
+
+    if not all([department_id, item_id, data.get('planned_quantity')]):
+        return jsonify({"error": "department_id, item_id, and planned_quantity are required"}), 400
+
+    try:
+        planned_quantity = float(data.get('planned_quantity'))
+        if planned_quantity <= 0:
+            return jsonify({"error": "planned_quantity must be greater than zero"}), 400
+    except (TypeError, ValueError):
+        return jsonify({"error": "planned_quantity must be a number"}), 400
+
+    try:
+        breakages = {k: float(v) for k, v in breakages_raw.items() if float(v or 0) > 0}
+    except (TypeError, ValueError):
+        return jsonify({"error": "breakages values must be numbers"}), 400
+
+    active_bom_version = BOMVersion.query.filter_by(finished_good_id=item_id, is_active=True).first()
+    bom_rows = active_bom_version.components if active_bom_version else []
+    if not bom_rows:
+        return jsonify({"error": "No recipe found for this item. Cannot assemble."}), 404
+
+    unknown_components = set(breakages) - {row.component_id for row in bom_rows}
+    if unknown_components:
+        return jsonify({"error": f"breakages references component(s) not in this recipe: {sorted(unknown_components)}"}), 400
+
+    # 1. THE SAFETY NET — every component must have enough stock for the
+    # FULL planned pull before anything is deducted (same pattern as
+    # log_production). Also compute the limiting factor: the most FG units
+    # any single component's surviving (unbroken) stock can support.
+    stock_by_component = {}
+    actual_output = planned_quantity
+    for bom in bom_rows:
+        pulled_qty = bom.quantity_required * planned_quantity
+        dept_stock = DepartmentStock.query.filter_by(
+            item_id=bom.component_id, department_id=department_id
+        ).with_for_update().first()
+
+        if not dept_stock or dept_stock.quantity < pulled_qty:
+            db.session.rollback()
+            comp = InternalProduct.query.get(bom.component_id)
+            comp_name = comp.name if comp else "Unknown Material"
+            available = dept_stock.quantity if dept_stock else 0.0
+            return jsonify({
+                "error": f"Insufficient stock. Need {pulled_qty} of {comp_name}, but department only has {available}."
+            }), 400
+
+        broken_qty = breakages.get(bom.component_id, 0.0)
+        if broken_qty > pulled_qty:
+            db.session.rollback()
+            comp = InternalProduct.query.get(bom.component_id)
+            comp_name = comp.name if comp else "Unknown Material"
+            return jsonify({
+                "error": f"Reported breakage ({broken_qty}) for {comp_name} exceeds the quantity pulled ({pulled_qty})."
+            }), 400
+
+        surviving_qty = pulled_qty - broken_qty
+        max_output_for_component = math.floor(surviving_qty / bom.quantity_required + 1e-9)
+        actual_output = min(actual_output, max_output_for_component)
+
+        stock_by_component[bom.component_id] = {
+            "record": dept_stock,
+            "pulled_qty": pulled_qty,
+            "broken_qty": broken_qty,
+            "quantity_required": bom.quantity_required,
+        }
+
+    actual_output = max(0, min(actual_output, planned_quantity))
+
+    if actual_output <= 0:
+        db.session.rollback()
+        return jsonify({"error": "Breakage reported leaves zero usable output — nothing to assemble."}), 400
+
+    # 2. CONSUME + RECONCILE, per component.
+    component_breakdown = []
+    for component_id, info in stock_by_component.items():
+        consumed_qty = actual_output * info["quantity_required"]
+        surplus_qty = info["pulled_qty"] - consumed_qty - info["broken_qty"]
+        # Floating point / floor() rounding can leave a hair of surplus —
+        # treat anything under a thousandth of a unit as exactly zero.
+        if surplus_qty < 1e-6:
+            surplus_qty = 0.0
+
+        # Deduct the full planned pull now...
+        info["record"].quantity -= info["pulled_qty"]
+        raw_item = InternalProduct.query.get(component_id)
+        if raw_item:
+            raw_item.current_stock -= info["pulled_qty"]
+
+        db.session.add(StockTransaction(
+            product_id=component_id, department_id=department_id, transaction_type='OUT',
+            quantity=info["pulled_qty"], is_manual=0, reason='Assembly consumption (planned pull)',
+            created_by=created_by,
+        ))
+
+        # ...then restock whatever wasn't actually needed at the reduced
+        # output — this is the reconciliation the spec calls for.
+        if surplus_qty > 0:
+            info["record"].quantity += surplus_qty
+            if raw_item:
+                raw_item.current_stock += surplus_qty
+            db.session.add(StockTransaction(
+                product_id=component_id, department_id=department_id, transaction_type='IN',
+                quantity=surplus_qty, is_manual=0,
+                reason=f"Breakage reconciliation — restocked unused stock (assembling {item_id})",
+                created_by=created_by,
+            ))
+
+        if raw_item:
+            check_low_stock(raw_item, department_id)
+
+        component_breakdown.append({
+            "component_id": component_id,
+            "component_name": raw_item.name if raw_item else None,
+            "pulled_qty": info["pulled_qty"],
+            "broken_qty": info["broken_qty"],
+            "consumed_qty": consumed_qty,
+            "restocked_qty": surplus_qty,
+        })
+
+    # 3. ADD THE FINISHED GOOD, at the reconciled (possibly reduced) output.
+    fg_stock = DepartmentStock.query.filter_by(item_id=item_id, department_id=department_id).first()
+    if fg_stock:
+        fg_stock.quantity += actual_output
+    else:
+        fg_stock = DepartmentStock(item_id=item_id, department_id=department_id, quantity=actual_output)
+        db.session.add(fg_stock)
+
+    fg_item = InternalProduct.query.get(item_id)
+    if fg_item:
+        fg_item.current_stock += actual_output
+
+    db.session.add(StockTransaction(
+        product_id=item_id, department_id=department_id, transaction_type='IN',
+        quantity=actual_output, is_manual=0, reason='Assembly output', created_by=created_by,
+    ))
+
+    log_audit(
+        'assembly.breakage_reconciliation', 'internal_product', item_id,
+        payload_before={"planned_quantity": planned_quantity, "breakages": breakages},
+        payload_after={"actual_output": actual_output, "components": component_breakdown},
+    )
+
+    try:
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "message": (
+                f"Assembled {actual_output} of {planned_quantity} planned units"
+                + (f" — limited by breakage." if actual_output < planned_quantity else ".")
+            ),
+            "planned_quantity": planned_quantity,
+            "actual_output": actual_output,
+            "components": component_breakdown,
+        }), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500

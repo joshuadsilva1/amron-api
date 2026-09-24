@@ -2,9 +2,23 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.item import InternalProduct
 from app.models.department import Department, DepartmentLevel
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
+from app.core.audit import log_audit
 
 items_bp = Blueprint('items', __name__)
+
+VALID_POWDER_COLOURS = {'White', 'Grey', 'Black'}
+
+
+def _clean_powder_colour(value):
+    """Returns (colour, error_message). colour is None (clear it), one of
+    VALID_POWDER_COLOURS, or the original value is rejected outright."""
+    if value in (None, ''):
+        return None, None
+    normalized = str(value).strip().capitalize()
+    if normalized not in VALID_POWDER_COLOURS:
+        return None, f"powder_colour must be one of {sorted(VALID_POWDER_COLOURS)} or blank"
+    return normalized, None
 
 @items_bp.route('/', methods=['GET', 'OPTIONS'], strict_slashes=False)
 @jwt_required
@@ -57,13 +71,15 @@ def get_items():
         "pcs_per_scan": i.pcs_per_scan,
         "price": getattr(i, 'price', 0.0),
         "box_qty": getattr(i, 'box_qty', 0),
-        "carton_qty": getattr(i, 'carton_qty', 0)
+        "carton_qty": getattr(i, 'carton_qty', 0),
+        "powder_colour": i.powder_colour,
     } for i in items]
 
     return jsonify({"status": "success", "data": result}), 200
 
 @items_bp.route('/', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory', 'manage_recipes')
 def create_item():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -79,6 +95,10 @@ def create_item():
     if existing:
         return jsonify({"error": f"Item code {item_code} already exists"}), 409
 
+    powder_colour, colour_error = _clean_powder_colour(data.get('powder_colour'))
+    if colour_error:
+        return jsonify({"error": colour_error}), 400
+
     new_item = InternalProduct(
         item_code=item_code,
         oem_company_code=data.get('oem_company_code'),
@@ -90,7 +110,8 @@ def create_item():
         pcs_per_scan=int(data.get('pcs_per_scan', 1)),
         price=float(data.get('price', 0.0)),
         box_qty=int(data.get('box_qty', 0)),
-        carton_qty=int(data.get('carton_qty', 0))
+        carton_qty=int(data.get('carton_qty', 0)),
+        powder_colour=powder_colour,
     )
 
     try:
@@ -107,6 +128,7 @@ def create_item():
 
 @items_bp.route('/<item_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory', 'manage_recipes')
 def update_item(item_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -134,6 +156,39 @@ def update_item(item_id):
     if 'price' in data: item.price = float(data['price'] or 0.0)
     if 'box_qty' in data: item.box_qty = int(data['box_qty'] or 0)
     if 'carton_qty' in data: item.carton_qty = int(data['carton_qty'] or 0)
+
+    if 'powder_colour' in data:
+        powder_colour, colour_error = _clean_powder_colour(data['powder_colour'])
+        if colour_error:
+            return jsonify({"error": colour_error}), 400
+        # Switching an item to White while it's already flagged
+        # colour_needed on a live recipe would silently violate the
+        # White->Colour block, so recheck every active BOM row that
+        # references this component before allowing the change.
+        if powder_colour == 'White':
+            from app.models.recipe import ProductBOM, BOMVersion
+            conflicting = (
+                db.session.query(ProductBOM)
+                .join(BOMVersion, ProductBOM.bom_version_id == BOMVersion.id)
+                .filter(
+                    BOMVersion.is_active == True,
+                    ProductBOM.component_id == item_id,
+                    ProductBOM.colour_needed == True,
+                )
+                .first()
+            )
+            if conflicting:
+                return jsonify({
+                    "error": "This item is used as a colour_needed component in an active recipe. "
+                             "White moulded parts can't be routed to Colour — update the recipe first."
+                }), 409
+        if powder_colour != item.powder_colour:
+            log_audit(
+                'item.powder_colour.update', 'internal_product', item_id,
+                payload_before={"item_code": item.item_code, "powder_colour": item.powder_colour},
+                payload_after={"item_code": item.item_code, "powder_colour": powder_colour},
+            )
+        item.powder_colour = powder_colour
 
     try:
         db.session.commit()

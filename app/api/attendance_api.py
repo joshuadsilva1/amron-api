@@ -3,12 +3,13 @@ from app import db
 from app.models.employee import Employee, AttendanceRecord
 from app.models.department import Department
 from datetime import datetime
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 attendance_bp = Blueprint('attendance', __name__)
 
 @attendance_bp.route('/employees', methods=['POST'])
 @jwt_required
+@permission_required('manage_payroll')
 def add_employee():
     """Creates a new employee from the modal"""
     data = request.get_json()
@@ -39,6 +40,7 @@ def add_employee():
 
 @attendance_bp.route('/daily', methods=['GET'])
 @jwt_required
+@permission_required('manage_payroll')
 def get_daily_attendance():
     """Fetches all active employees and their attendance for a specific date"""
     date_str = request.args.get('date') # Expected format: YYYY-MM-DD
@@ -82,6 +84,7 @@ def get_daily_attendance():
 
 @attendance_bp.route('/mark', methods=['POST'])
 @jwt_required
+@permission_required('manage_payroll')
 def mark_attendance():
     """Marks or updates an employee's status/OT for a specific day"""
     data = request.get_json()

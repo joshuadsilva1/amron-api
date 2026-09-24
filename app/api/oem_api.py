@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.item import OEMCompanyCode, InternalProduct
 from app.models.client import Client
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 oem_bp = Blueprint('oem', __name__)
 
@@ -38,6 +38,7 @@ def get_mappings():
 
 @oem_bp.route('/', methods=['POST'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_oem')
 def create_mapping():
     """Creates a new OEM mapping by looking up the client and product names"""
     data = request.get_json()

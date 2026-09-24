@@ -22,7 +22,15 @@ if __name__ == '__main__':
     # so debug is forced off there even if FLASK_DEBUG isn't set explicitly.
     debug = os.getenv('FLASK_DEBUG', '1') == '1' and not os.getenv('RENDER')
 
-    with app.app_context():
-        db.create_all()
+    # NOT db.create_all() — this project's schema is tracked entirely by
+    # Alembic (migrations/versions/, applied via `flask db upgrade`; Render
+    # runs that same command as its preDeployCommand). create_all() used to
+    # run here on every dev-server start/reload and would silently create a
+    # brand-new model's table straight from its class definition — skipping
+    # that migration's seed data AND never touching alembic_version. The
+    # next real `flask db upgrade` then hit "relation already exists" and
+    # looked like a stuck migration state (see the report_subscriptions and
+    # system_settings/audit_logs incidents). Run `flask db upgrade` by hand
+    # after pulling a new model/migration instead.
 
     app.run(host='0.0.0.0', port=5000, debug=debug)

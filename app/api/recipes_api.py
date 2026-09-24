@@ -2,23 +2,36 @@ from flask import Blueprint, request, jsonify, g
 from app import db
 from app.models.recipe import ProductBOM, BOMVersion
 from app.models.item import InternalProduct
+from app.models.department import Department
+from app.core.department_levels import is_finished_good
 from app.core.decorators import jwt_required, permission_required, user_has_permission
 from app.core.bom import explode_product_quantity
+from app.models.system_setting import get_default_wastage_percent
 from sqlalchemy import func
 
 recipes_bp = Blueprint('recipes', __name__)
 
 
 def _serialize_components(bom_version):
+    """One finished good's components can be drawn from several different
+    departments (e.g. a moulded body from Moulding plus a brass insert
+    from Brasspart) — component_department_* here is what tells the UI
+    (and anything downstream reading this list) which department each
+    line is actually coming from, since ProductBOM itself has no
+    department column (see app/models/recipe.py)."""
     components = []
     for b in bom_version.components:
         comp = InternalProduct.query.get(b.component_id)
+        dept = Department.query.get(comp.department_id) if comp and comp.department_id else None
         has_sub_recipe = BOMVersion.query.filter_by(finished_good_id=b.component_id, is_active=True).first() is not None
         components.append({
             "id": b.id,
             "component_id": b.component_id,
             "component_code": comp.item_code if comp else None,
             "component_name": comp.name if comp else None,
+            "component_department_id": comp.department_id if comp else None,
+            "component_department_name": dept.name if dept else None,
+            "component_powder_colour": comp.powder_colour if comp else None,
             "quantity_required": b.quantity_required,
             "lazer_needed": b.lazer_needed,
             "colour_needed": b.colour_needed,
@@ -43,12 +56,14 @@ def list_recipes():
             continue
 
         components = _serialize_components(bv)
+        departments = sorted({c["component_department_name"] for c in components if c["component_department_name"]})
         result.append({
             "finished_good_id": bv.finished_good_id,
             "finished_good_code": fg.item_code,
             "finished_good_name": fg.name,
             "version": bv.version,
             "component_count": len(components),
+            "departments": departments,
             "components": components,
         })
 
@@ -98,12 +113,21 @@ def create_recipe():
         cid = comp.get('component_id') or comp.get('input_item_id')
         if cid == finished_good_id:
             return jsonify({"error": "A recipe cannot include itself as a component"}), 400
+        component = InternalProduct.query.get(cid)
+        if is_finished_good(component):
+            return jsonify({
+                "error": f"'{component.item_code}' is a finished good and can't be a component of another recipe."
+            }), 400
 
     can_edit_wastage = user_has_permission(g.current_user, 'manage_wastage')
 
-    # Carry-forward map for wastage_percent: {component_id: last active value}
+    # Carry-forward map for wastage_percent: {component_id: last active value}.
+    # A component with no prior value (brand new to this recipe) falls back
+    # to the admin-configurable default rather than a hardcoded 0 — see
+    # system_settings.default_wastage_percent.
     prior_version = BOMVersion.query.filter_by(finished_good_id=finished_good_id, is_active=True).first()
     prior_wastage = {row.component_id: row.wastage_percent for row in prior_version.components} if prior_version else {}
+    default_wastage = get_default_wastage_percent()
 
     last_version = db.session.query(func.max(BOMVersion.version)).filter_by(
         finished_good_id=finished_good_id
@@ -128,7 +152,7 @@ def create_recipe():
         lazer_needed = bool(comp.get('lazer_needed', False))
         colour_needed = bool(comp.get('colour_needed', False))
 
-        carried_forward = prior_wastage.get(component_id, 0.0)
+        carried_forward = prior_wastage.get(component_id, default_wastage)
         if 'wastage_percent' in comp:
             requested_wastage = float(comp.get('wastage_percent') or 0)
             if requested_wastage != carried_forward and not can_edit_wastage:
@@ -148,9 +172,19 @@ def create_recipe():
             db.session.rollback()
             return jsonify({"error": "Component quantities must be greater than zero"}), 400
 
-        if not InternalProduct.query.get(component_id):
+        component_row = InternalProduct.query.get(component_id)
+        if not component_row:
             db.session.rollback()
             return jsonify({"error": f"Component ID {component_id} not found"}), 404
+
+        # Hard routing rule: powder colour dictates the Colour department.
+        # Only Black/Grey moulded parts may go there — White never can.
+        if colour_needed and component_row.powder_colour == 'White':
+            db.session.rollback()
+            return jsonify({
+                "error": f"'{component_row.item_code}' is a White moulded part and can never be routed to "
+                         "Colour. Only Black/Grey parts may set colour_needed."
+            }), 400
 
         db.session.add(ProductBOM(
             bom_version_id=new_version.id,

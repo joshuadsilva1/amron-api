@@ -6,7 +6,7 @@ from app.models.order import PurchaseOrder, PO_STATUS_PIPELINE
 from app.models.item import InternalProduct, OEMCompanyCode
 from app.models.recipe import BOMVersion
 from app.models.department import Department
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 from app.core.notify import create_notification
 
 department_po_bp = Blueprint('department_pos', __name__)
@@ -40,38 +40,28 @@ def _serialize(dpo):
     }
 
 
-@department_po_bp.route('/generate', methods=['POST', 'OPTIONS'], strict_slashes=False)
-@jwt_required
-def generate_from_po():
+def _raise_for_po(po, user_id):
+    """Raises/tops up the internal DepartmentPOs for ONE customer PO (no
+    commit — the caller commits once for the whole batch). Returns
+    (result, department_po_ids) where result is
+    {"po_id", "ok", "changed", "message"}.
+
+    Explodes ONE LEVEL of each line item's finished-good recipe — not the
+    full multi-level explosion an MRP raw-material check uses. A department
+    only needs to know about ITS OWN direct components; if one of those
+    components itself needs raw material (e.g. a moulded part needing
+    powder), that's that department's own problem — visible on its own
+    Stock vs PO screen and bought via Supplier Orders, not something this
+    step should be raising a cross-department ticket for.
+
+    Aggregates by (department, component) across the PO's line items and
+    keeps one open DepartmentPO per department. Safe to run again: an
+    existing open DepartmentPO is only topped up by whatever is NOT already
+    outstanding on it, so re-sending the same PO adds nothing, and
+    re-sending after a late-added line item adds just that line's demand.
     """
-    The "we picked up the PO, here's what Moulding/Brasspart owe it" step.
-    Explodes ONE LEVEL of each PO line item's finished-good recipe — not
-    the full multi-level explosion an MRP raw-material check uses. A
-    department only needs to know about ITS OWN direct components; if one
-    of those components itself needs raw material (e.g. a moulded part
-    needing powder), that's that department's own problem — visible on
-    its own Stock vs PO screen and bought via Supplier Orders, not
-    something this step should be raising a cross-department ticket for.
-
-    Aggregates by (department, component) across every line item on the
-    PO, creates one DepartmentPO per department owing something, and
-    notifies each department. Re-running this for the same PO tops up
-    quantities on top of what's already been raised (it does not create
-    duplicate DepartmentPOs for a department that already has an open one
-    from this PO) — safe to call again after a late-added line item.
-    Body: {"po_id": "..."}
-    """
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-
-    data = request.get_json(silent=True) or {}
-    po_id = data.get('po_id')
-    if not po_id:
-        return jsonify({"error": "po_id is required"}), 400
-
-    po = PurchaseOrder.query.get(po_id)
-    if not po or not po.is_active:
-        return jsonify({"error": "Purchase order not found"}), 404
+    label = f"PO {po.id[:8]}"
+    problems = []
 
     # {(department_id, component_id): quantity}
     demand = {}
@@ -81,15 +71,22 @@ def generate_from_po():
             continue
         mapping = OEMCompanyCode.query.get(li.mapping_id)
         if not mapping:
+            problems.append("a line has no product mapping (check Party Products)")
             continue
 
+        fg = InternalProduct.query.get(mapping.internal_product_id)
+        fg_code = fg.item_code if fg else "a product"
         bom_version = BOMVersion.query.filter_by(finished_good_id=mapping.internal_product_id, is_active=True).first()
         if not bom_version:
+            problems.append(f"{fg_code} has no active recipe")
             continue
 
         for row in bom_version.components:
             comp = InternalProduct.query.get(row.component_id)
-            if not comp or not comp.department_id:
+            if not comp:
+                continue
+            if not comp.department_id:
+                problems.append(f"{comp.item_code} (in {fg_code}'s recipe) has no department")
                 continue
             # Same convention log_production uses to consume department
             # stock (raw quantity_required, no MRP-style unit
@@ -101,22 +98,21 @@ def generate_from_po():
             demand[key] = demand.get(key, 0) + qty
 
     if not demand:
-        return jsonify({
-            "error": "Nothing to raise — this PO's line items have no recipe, or nothing remains to produce."
-        }), 400
+        reason = "; ".join(dict.fromkeys(problems)) if problems else "nothing remains to produce"
+        return {"po_id": po.id, "ok": False, "changed": False,
+                "message": f"{label}: nothing to raise — {reason}."}, []
 
     by_department = {}
     for (department_id, component_id), qty in demand.items():
         by_department.setdefault(department_id, []).append((component_id, qty))
 
-    created = []
+    touched_ids = []
+    changed = False
     for department_id, component_rows in by_department.items():
         dept = Department.query.get(department_id)
         if not dept:
             continue
 
-        # Top up an existing open DepartmentPO for this exact PO +
-        # department instead of spawning a duplicate.
         dpo = DepartmentPO.query.filter(
             DepartmentPO.source_po_id == po.id,
             DepartmentPO.department_id == department_id,
@@ -129,7 +125,7 @@ def generate_from_po():
                 department_id=department_id,
                 source_po_id=po.id,
                 is_urgent=po.is_urgent,
-                created_by=g.current_user.id,
+                created_by=user_id,
             )
             db.session.add(dpo)
             db.session.flush()
@@ -141,21 +137,29 @@ def generate_from_po():
             comp = InternalProduct.query.get(component_id)
             existing_item = existing_items_by_component.get(component_id)
             if existing_item:
-                existing_item.quantity_requested = (existing_item.quantity_requested or 0) + qty
+                outstanding = (existing_item.quantity_requested or 0) - (existing_item.quantity_fulfilled or 0)
+                delta = qty - outstanding
+                if delta <= 1e-9:
+                    continue  # already asked for (or more) — nothing new
+                existing_item.quantity_requested = (existing_item.quantity_requested or 0) + delta
+                added = delta
             else:
                 db.session.add(DepartmentPOItem(
                     department_po_id=dpo.id,
                     component_id=component_id,
                     quantity_requested=qty,
                 ))
-            lines.append(f"• {comp.name if comp else component_id}: {round(qty, 2)} {comp.unit_of_measure if comp else ''}")
+                added = qty
+            lines.append(f"• {comp.name if comp else component_id}: {round(added, 2)} {comp.unit_of_measure if comp else ''}")
 
-        create_notification(
-            title=f"{'New' if is_new else 'Updated'} internal PO — {dept.name}",
-            message=f"Needed for customer PO {po.id[:8]}:\n" + "\n".join(lines),
-            department_id=department_id,
-        )
-        created.append(dpo.id)
+        touched_ids.append(dpo.id)
+        if lines:
+            changed = True
+            create_notification(
+                title=f"{'New' if is_new else 'Updated'} internal PO — {dept.name}",
+                message=f"Needed for customer PO {po.id[:8]}:\n" + "\n".join(lines),
+                department_id=department_id,
+            )
 
     # Move the source PO forward into Material Check, but never backward —
     # a PO already further along (e.g. In Production) shouldn't regress
@@ -164,9 +168,53 @@ def generate_from_po():
         current_idx = PO_STATUS_PIPELINE.index(po.status)
     except ValueError:
         current_idx = -1
-    target_idx = PO_STATUS_PIPELINE.index('Material Check')
-    if current_idx < target_idx:
+    if current_idx < PO_STATUS_PIPELINE.index('Material Check'):
         po.status = 'Material Check'
+
+    message = (f"{label}: raised {len(touched_ids)} internal PO(s)." if changed
+               else f"{label}: already sent — nothing new to add.")
+    return {"po_id": po.id, "ok": True, "changed": changed, "message": message}, touched_ids
+
+
+@department_po_bp.route('/generate', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('create_po')
+def generate_from_po():
+    """
+    The "we picked up the PO, here's what Moulding/Brasspart owe it" step,
+    for one customer PO or many at once (see _raise_for_po for the rules).
+    Body: {"po_id": "..."} or {"po_ids": ["...", "..."]}
+
+    A PO that can't be raised (no recipe, nothing left to produce, ...)
+    doesn't block the others in a batch — it's reported in `results` with
+    the reason. If NOTHING could be raised the response is a 400 carrying
+    those reasons.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    po_ids = data.get('po_ids') or ([data['po_id']] if data.get('po_id') else [])
+    po_ids = list(dict.fromkeys(po_ids))
+    if not po_ids:
+        return jsonify({"error": "po_id or po_ids is required"}), 400
+
+    results = []
+    department_po_ids = []
+    for po_id in po_ids:
+        po = PurchaseOrder.query.get(po_id)
+        if not po or not po.is_active:
+            results.append({"po_id": po_id, "ok": False, "changed": False,
+                            "message": f"PO {str(po_id)[:8]}: not found."})
+            continue
+        result, touched = _raise_for_po(po, g.current_user.id)
+        results.append(result)
+        department_po_ids.extend(touched)
+
+    ok_count = sum(1 for r in results if r["ok"])
+    if ok_count == 0:
+        db.session.rollback()
+        return jsonify({"error": "\n".join(r["message"] for r in results), "results": results}), 400
 
     try:
         db.session.commit()
@@ -174,10 +222,19 @@ def generate_from_po():
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
 
+    sent = sum(1 for r in results if r["changed"])
+    unchanged = sum(1 for r in results if r["ok"] and not r["changed"])
+    failed = [r["message"] for r in results if not r["ok"]]
+    parts = [f"Sent {sent} order(s) to departments."]
+    if unchanged:
+        parts.append(f"{unchanged} already sent.")
+    if failed:
+        parts.append(f"{len(failed)} skipped:\n" + "\n".join(failed))
     return jsonify({
         "status": "success",
-        "message": f"Raised/updated {len(created)} internal PO(s).",
-        "department_po_ids": created,
+        "message": " ".join(parts),
+        "department_po_ids": list(dict.fromkeys(department_po_ids)),
+        "results": results,
     }), 201
 
 

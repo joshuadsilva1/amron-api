@@ -3,12 +3,13 @@ from app import db
 from app.models.dispatch import DispatchChallan, DispatchChallanItem
 from app.models.client import Client
 from app.models.item import InternalProduct
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 dispatch_bp = Blueprint('dispatch', __name__)
 
 @dispatch_bp.route('/challans', methods=['POST'])
 @jwt_required
+@permission_required('dispatch_goods')
 def create_dispatch_challan():
     """Creates a new outbound dispatch challan manually (Planned Dispatch)"""
     data = request.get_json()
@@ -65,6 +66,7 @@ def create_dispatch_challan():
 
 @dispatch_bp.route('/challans', methods=['GET'])
 @jwt_required
+@permission_required('dispatch_goods', 'view_challans')
 def get_dispatch_challans():
     """Fetches outbound dispatch challans for the UI tabs"""
     challans = DispatchChallan.query.order_by(DispatchChallan.created_at.desc()).all()

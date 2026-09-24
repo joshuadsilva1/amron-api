@@ -121,7 +121,7 @@ from app import db
 from app.models.department import Department, DeptLevel, DepartmentLevel
 from app.models.item import DepartmentStock, InternalProduct
 from app.models.user import User
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 department_bp = Blueprint('departments', __name__)
 
@@ -144,6 +144,7 @@ def get_departments():
 
 @department_bp.route('/', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def create_department():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -197,6 +198,7 @@ def create_department():
 
 @department_bp.route('/<string:department_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def update_department(department_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -250,6 +252,7 @@ def update_department(department_id):
 
 @department_bp.route('/<string:department_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def delete_department(department_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -334,6 +337,7 @@ def get_department_levels():
 
 @department_bp.route('/levels', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def create_department_level():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -369,6 +373,7 @@ def create_department_level():
 
 @department_bp.route('/levels/<int:level_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def update_department_level(level_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -409,6 +414,7 @@ def update_department_level(level_id):
 
 @department_bp.route('/levels/<int:level_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_departments')
 def delete_department_level(level_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200

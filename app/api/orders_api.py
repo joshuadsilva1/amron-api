@@ -5,7 +5,7 @@ from app.models.item import InternalProduct, OEMCompanyCode
 from app.models.client import Client
 from sqlalchemy import func
 from datetime import datetime
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 
 orders_bp = Blueprint('orders', __name__)
@@ -66,6 +66,7 @@ def list_orders():
 
 @orders_bp.route('', methods=['POST'], strict_slashes=False)
 @jwt_required
+@permission_required('create_po')
 def create_po():
     """
     Endpoint for Production Manager to enter a Client PO.
@@ -164,6 +165,7 @@ def get_status_pipeline():
 
 @orders_bp.route('/<po_id>/status', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('create_po')
 def update_po_status(po_id):
     """Moves a PO to a new stage in PO_STATUS_PIPELINE. Not restricted to
     the next sequential stage — manufacturing reality sometimes needs a
@@ -193,6 +195,7 @@ def update_po_status(po_id):
 
 @orders_bp.route('/line-items/<line_item_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('create_po')
 def update_line_item_progress(line_item_id):
     """Updates a line item's production/dispatch progress independently of
     the parent PO's overall status — one PO can have one line fully done

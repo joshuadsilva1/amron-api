@@ -31,13 +31,9 @@ def _po_risk_color(po, total_qty, dispatched_qty):
     return 'GREEN'
 
 
-@control_tower_bp.route('/summary', methods=['GET', 'OPTIONS'], strict_slashes=False)
-@jwt_required
-def get_summary():
-    from flask import request
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
-
+def compute_summary():
+    """Today's factory numbers + the order board. Shared by the Control
+    Tower endpoint below and the daily WhatsApp report (core/daily_report)."""
     today = datetime.utcnow().date()
     tomorrow = today + timedelta(days=1)
     today_start = datetime.combine(today, datetime.min.time())
@@ -126,7 +122,7 @@ def get_summary():
     risk_order = {'RED': 0, 'YELLOW': 1, 'GREEN': 2}
     order_rows.sort(key=lambda r: (risk_order.get(r['risk'], 3), r['due_date'] or '9999'))
 
-    return jsonify({
+    return {
         "status": "success",
         "generated_at": datetime.utcnow().isoformat(),
         "today": {
@@ -146,4 +142,13 @@ def get_summary():
         },
         "orders": order_rows,
         "status_pipeline": PO_STATUS_PIPELINE,
-    }), 200
+    }
+
+
+@control_tower_bp.route('/summary', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+def get_summary():
+    from flask import request
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    return jsonify(compute_summary()), 200

@@ -2,12 +2,13 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.employee import Employee, AttendanceRecord
 import calendar
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 payroll_bp = Blueprint('payroll', __name__)
 
 @payroll_bp.route('/report', methods=['GET'])
 @jwt_required
+@permission_required('manage_payroll')
 def get_payroll_report():
     """
     Calculates monthly payroll based on attendance records and base salary.

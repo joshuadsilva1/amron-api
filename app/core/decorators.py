@@ -63,6 +63,7 @@
 
 from functools import wraps
 from flask import request, jsonify, g
+from sqlalchemy.exc import SQLAlchemyError
 from app.models.user import User
 from app.core.jwt import decode_token
 from app import db
@@ -83,19 +84,31 @@ def jwt_required(f):
 
         token = auth_header.split(" ")[1]
 
-        # ONLY wrap the token decoding and user fetching in the try-except
+        # ONLY wrap the token decoding and user fetching in the try-except.
+        # A dropped DB connection (SQLAlchemyError) is NOT an auth failure —
+        # the frontend force-logs-out on any 401 (see services/api.ts), so
+        # mislabeling a transient DB blip as "invalid token" was wiping real
+        # users' sessions for something pool_pre_ping (see app/__init__.py)
+        # should now mostly prevent anyway. Only an actual bad/expired token
+        # or missing user gets 401; a DB error gets 503 so the client can
+        # retry instead of logging out.
         try:
             payload = decode_token(token)
-            user = db.session.get(User, payload["user_id"])
-
-            if not user:
-                return jsonify({"message": "User not found"}), 401
-
-            g.current_user = user
-            
         except Exception as e:
             print(f"Token error: {e}")
             return jsonify({"message": "Invalid or expired token"}), 401
+
+        try:
+            user = db.session.get(User, payload["user_id"])
+        except SQLAlchemyError as e:
+            db.session.rollback()
+            print(f"DB error while resolving user from token: {e}")
+            return jsonify({"message": "Service temporarily unavailable, please retry"}), 503
+
+        if not user:
+            return jsonify({"message": "User not found"}), 401
+
+        g.current_user = user
 
         # EXECUTE THE ROUTE OUTSIDE THE TRY-EXCEPT!
         # Now, if the database crashes, it returns a 500 instead of a fake 401

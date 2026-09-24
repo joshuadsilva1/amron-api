@@ -8,7 +8,7 @@ from app.models.client import Client
 from app.core.mrp import compute_shortages
 from app.core.bom import explode_product_quantity
 from datetime import datetime, timedelta
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 from app.core.notify import create_notification
 
 
@@ -18,6 +18,7 @@ CLOSED_PO_STAGES = {'Dispatched', 'Closed'}
 
 @production_bp.route('/', methods=['POST'])
 @jwt_required
+@permission_required('manage_production')
 def create_plan():
     """
     Creates a daily production allocation.
@@ -122,6 +123,7 @@ def get_plans():
 
 @production_bp.route('/send-schedule', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_production')
 def send_schedule():
     """Production Manager pushes the day's work allotment out to a
     department as a single notification, which floor workers see in their
@@ -183,6 +185,7 @@ def send_schedule():
 
 @production_bp.route('/<plan_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_production')
 def update_plan(plan_id):
     """Updates a plan row's target/completed quantity, priority, or
     status. Marking a row Completed while short of target requires a
@@ -234,6 +237,7 @@ def update_plan(plan_id):
 
 @production_bp.route('/<plan_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_production')
 def delete_plan(plan_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -254,6 +258,7 @@ def delete_plan(plan_id):
 
 @production_bp.route('/plan-day/<date_str>/status', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_production')
 def set_plan_day_status(date_str):
     """Moves a whole day's plan through Draft -> Validated -> Approved ->
     Released. Only a Released plan is considered live/departments' actual

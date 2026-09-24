@@ -36,6 +36,19 @@ def create_app():
 
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+    # Supabase's connection pooler silently drops idle connections. Without
+    # this, SQLAlchemy keeps handing out those dead connections and every
+    # request on one fails with "server closed the connection unexpectedly"
+    # — which jwt_required (see app/core/decorators.py) was misreporting as
+    # an invalid token, forcing a real user logout on the frontend for a
+    # transient DB blip. pool_pre_ping tests a connection before use and
+    # transparently reconnects; pool_recycle retires connections before the
+    # pooler's own idle timeout gets to them.
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,
+        "pool_recycle": 280,
+    }
+
     db.init_app(app)
     migrate.init_app(app, db, render_as_batch=True)
 
@@ -87,6 +100,9 @@ def create_app():
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(import_bp, url_prefix='/api/import')
     app.register_blueprint(whatsapp_bp, url_prefix='/api/whatsapp')
+
+    from app.cli import register_cli
+    register_cli(app)
     app.register_blueprint(chat_bp, url_prefix='/api/chat')
     app.register_blueprint(box_bp, url_prefix='/api/boxes')
     app.register_blueprint(control_tower_bp, url_prefix='/api/control-tower')

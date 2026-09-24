@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from app import db
 from app.models.rack import Rack
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 racks_bp = Blueprint('racks', __name__)
 
@@ -32,6 +32,7 @@ def get_racks():
 
 @racks_bp.route('/', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def create_rack():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -64,6 +65,7 @@ def create_rack():
 
 @racks_bp.route('/<rack_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def update_rack(rack_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200

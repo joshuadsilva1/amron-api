@@ -6,7 +6,7 @@ from app import db
 from app.models.supplier import Supplier
 from app.models.supplier_order import SupplierOrder, SupplierOrderItem
 from app.models.item import InternalProduct
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 from app.core.notify import create_notification
 from app.core.storage import upload_file
 
@@ -18,6 +18,7 @@ ALLOWED_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
 
 @suppliers_bp.route('/', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def create_supplier():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -53,6 +54,7 @@ def get_suppliers():
 
 @suppliers_bp.route('/<supplier_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def update_supplier(supplier_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -87,6 +89,7 @@ def update_supplier(supplier_id):
 
 @suppliers_bp.route('/<supplier_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def delete_supplier(supplier_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -116,6 +119,7 @@ def delete_supplier(supplier_id):
 
 @suppliers_bp.route('/orders', methods=['POST','OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def create_supplier_order():
     if request.method == 'OPTIONS':
             return jsonify({}), 200
@@ -152,6 +156,7 @@ def create_supplier_order():
 
 @suppliers_bp.route('/orders/<order_id>/status', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def update_supplier_order_status(order_id):
     """Production Manager approves or rejects a supplier order once it comes in."""
     if request.method == 'OPTIONS':
@@ -189,6 +194,7 @@ def update_supplier_order_status(order_id):
 
 @suppliers_bp.route('/orders/<order_id>/bill', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_suppliers')
 def upload_bill_image(order_id):
     """Attach a photo of the supplier's bill/chalan to a supplier order."""
     if request.method == 'OPTIONS':

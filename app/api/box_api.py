@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from app import db
 from app.models.item import BoxMapping, InternalProduct
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 box_bp = Blueprint('boxes', __name__)
 
@@ -37,6 +37,7 @@ def get_box_mappings():
 
 @box_bp.route('/mappings', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def create_or_update_box_mapping():
     """Upsert: saving the same (box, product) pair again just updates the
     quantity instead of erroring, so re-editing from the UI is simple."""
@@ -85,6 +86,7 @@ def create_or_update_box_mapping():
 
 @box_bp.route('/mappings/<mapping_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('scan_inventory')
 def delete_box_mapping(mapping_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200

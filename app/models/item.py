@@ -26,7 +26,14 @@ class InternalProduct(db.Model):
 
     current_stock = db.Column(db.Float, default=0.0)
     reorder_level = db.Column(db.Float, default=0.0)
-    
+
+    # Only meaningful for moulded components (Moulding department items):
+    # the plastic granule/powder colour this specific item was moulded in.
+    # NULL for anything that isn't a colour-tracked moulded part (brass,
+    # boxes, labels, ...). Drives the White->Colour routing block — see
+    # recipes_api.create_recipe.
+    powder_colour = db.Column(db.String(10), nullable=True)  # 'White' | 'Grey' | 'Black'
+
     is_active = db.Column(db.Integer, default=1)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 

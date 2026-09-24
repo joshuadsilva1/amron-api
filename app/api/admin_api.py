@@ -1,11 +1,15 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, g
 from app import db
 from app.models.user import User, Role
 from app.models.department import DepartmentRoute
 from app.models.department import Department
 from app.models.user import Permission
 # Assuming you have a jwt_required decorator, import it here
-from app.core.decorators import jwt_required 
+from app.core.decorators import jwt_required, permission_required
+from app.core.utils import normalize_phone_number
+from app.models.system_setting import SystemSetting, DEFAULT_SETTINGS
+from app.models.audit_log import AuditLog
+from app.core.audit import log_audit
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/api/admin')
 
@@ -15,6 +19,7 @@ from app.models.user import AppModule # Make sure AppModule is imported at the t
 
 @admin_bp.route('/roles', methods=['GET', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def get_roles_and_permissions():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -43,6 +48,7 @@ def get_roles_and_permissions():
 
 @admin_bp.route('/roles/<int:role_id>/permissions', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def update_role_permissions(role_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -50,16 +56,25 @@ def update_role_permissions(role_id):
     role = Role.query.get(role_id)
     if not role:
         return jsonify({"message": "Role not found"}), 404
-        
+
     data = request.get_json(silent=True) or {}
     new_permission_ids = data.get('permission_ids', [])
-    
+
     # Fetch the actual Permission objects based on the provided IDs
     new_permissions = Permission.query.filter(Permission.id.in_(new_permission_ids)).all()
-    
+
+    before_names = sorted(p.name for p in role.permissions)
+
     # SQLAlchemy makes updating many-to-many relationships incredibly easy
     # Just overwrite the array and commit!
     role.permissions = new_permissions
+
+    log_audit(
+        'role.permissions.update', 'role', role_id,
+        payload_before={"role": role.name, "permissions": before_names},
+        payload_after={"role": role.name, "permissions": sorted(p.name for p in new_permissions)},
+    )
+
     try:
         db.session.commit()
     except Exception as e:
@@ -70,6 +85,7 @@ def update_role_permissions(role_id):
 
 @admin_bp.route('/roles/<int:role_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def delete_role(role_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -84,6 +100,11 @@ def delete_role(role_id):
             "error": f"Cannot delete '{role.name}' — {users_with_role} user(s) are still assigned to it. Reassign them first."
         }), 409
 
+    log_audit(
+        'role.delete', 'role', role_id,
+        payload_before={"name": role.name, "permissions": sorted(p.name for p in role.permissions)},
+    )
+
     db.session.delete(role)
     try:
         db.session.commit()
@@ -95,6 +116,12 @@ def delete_role(role_id):
 
 @admin_bp.route('/modules', methods=['GET'])
 @jwt_required
+# Deliberately NOT permission_required('admin_access') — every authenticated
+# user's sidebar calls this (see (protected)/_layout.tsx and
+# components/common/RequireModuleAccess.tsx) to know which routes are gated
+# at all, so it can tell "not configured" apart from "configured but denied
+# to you". It only returns module metadata (name/route/icon/description),
+# not anything sensitive like role assignments.
 def get_all_modules():
     """Fetch all dynamic app modules"""
     modules = AppModule.query.all()
@@ -114,14 +141,23 @@ def get_all_modules():
 
 @admin_bp.route('/modules/<int:module_id>/toggle', methods=['PUT'])
 @jwt_required
+@permission_required('admin_access')
 def toggle_module(module_id):
     """Toggle a module on or off for the entire system"""
     module = AppModule.query.get(module_id)
     if not module:
         return jsonify({"message": "Module not found"}), 404
-        
+
     # Flip the boolean
+    was_active = module.is_active
     module.is_active = not module.is_active
+
+    log_audit(
+        'module.toggle', 'app_module', module_id,
+        payload_before={"name": module.name, "is_active": was_active},
+        payload_after={"name": module.name, "is_active": module.is_active},
+    )
+
     try:
         db.session.commit()
     except Exception as e:
@@ -136,6 +172,7 @@ def toggle_module(module_id):
 
 @admin_bp.route('/routing/sync', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def sync_routing_board():
     """Sync the entire routing board state at once"""
     
@@ -184,6 +221,7 @@ def sync_routing_board():
 
 @admin_bp.route('/users', methods=['GET'])
 @jwt_required
+@permission_required('admin_access')
 def get_all_users():
     """Fetch all users and their assigned roles"""
     users = User.query.all()
@@ -212,32 +250,59 @@ def get_all_users():
 
 @admin_bp.route('/users', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def add_user():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
         
     data = request.get_json(silent=True) or {}
-    phone = data.get('phone')
+    phone = normalize_phone_number(data.get('phone'))
     name = data.get('name')
     role_id = data.get('role_id')
-    
+
     if not phone:
         return jsonify({"message": "Phone number is required"}), 400
-        
+
     # FORCE A ROLE TO BE SELECTED. If none is passed, reject it.
     if not role_id:
         return jsonify({"message": "A role must be assigned to new users."}), 400
-        
+
+    # If this number already self-registered via Firebase (e.g. they tried
+    # logging in before an admin got to them, landing on PENDING), assign
+    # the role to that existing account instead of rejecting — otherwise
+    # the number the admin "added" here and the number Firebase actually
+    # logs them in as never match, and they're stuck on "awaiting approval"
+    # forever even though a role was assigned.
     existing_user = User.query.filter_by(phone_number=phone).first()
     if existing_user:
-        return jsonify({"message": "A user with this phone number already exists"}), 400
-        
+        before_role = existing_user.role_data.name if existing_user.role_data else None
+        existing_user.role_id = role_id
+        if name:
+            existing_user.full_name = name
+        after_role = existing_user.role_data.name if existing_user.role_data else None
+        log_audit(
+            'user.role_assign', 'user', existing_user.id,
+            payload_before={"phone": phone, "role": before_role},
+            payload_after={"phone": phone, "role": after_role},
+        )
+        try:
+            db.session.commit()
+            return jsonify({"message": "Existing account found for this number — role assigned"}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"error": str(e)}), 500
+
     new_user = User(
         phone_number=phone,
         full_name=name,
         role_id=role_id
     )
     db.session.add(new_user)
+    db.session.flush()
+    log_audit(
+        'user.create', 'user', new_user.id,
+        payload_after={"phone": phone, "name": name, "role": new_user.role_data.name if new_user.role_data else None},
+    )
     try:
         db.session.commit()
     except Exception as e:
@@ -249,6 +314,7 @@ def add_user():
 
 @admin_bp.route('/users/<user_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def update_user_details(user_id):
     """Update a user's name, phone, or role"""
     if request.method == 'OPTIONS':
@@ -259,13 +325,27 @@ def update_user_details(user_id):
     user = User.query.get(user_id)
     if not user:
         return jsonify({"message": "User not found"}), 404
-        
+
+    before = {
+        "name": user.full_name,
+        "phone": user.phone_number,
+        "role": user.role_data.name if user.role_data else None,
+    }
+
     if 'role_id' in data and data['role_id']:
         user.role_id = data['role_id']
     if 'name' in data:
         user.full_name = data['name']
     if 'phone' in data:
-        user.phone_number = data['phone']
+        user.phone_number = normalize_phone_number(data['phone'])
+
+    after = {
+        "name": user.full_name,
+        "phone": user.phone_number,
+        "role": user.role_data.name if user.role_data else None,
+    }
+    if after != before:
+        log_audit('user.update', 'user', user.id, payload_before=before, payload_after=after)
 
     try:
         db.session.commit()
@@ -277,6 +357,7 @@ def update_user_details(user_id):
 
 @admin_bp.route('/routing', methods=['GET', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def get_all_routes():
     """Fetch all active department connections"""
     routes = DepartmentRoute.query.all()
@@ -293,6 +374,7 @@ def get_all_routes():
 
 @admin_bp.route('/routing', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def create_route():
     """Create a new connection between two departments"""
     data = request.json
@@ -326,6 +408,7 @@ def create_route():
 
 @admin_bp.route('/routing/<route_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('admin_access')
 def delete_route(route_id):
     """Remove a connection between departments"""
     route = DepartmentRoute.query.get(route_id)
@@ -340,6 +423,139 @@ def delete_route(route_id):
         return jsonify({"error": str(e)}), 500
 
     return jsonify({"message": "Route removed successfully"}), 200
+
+
+# ==========================================
+# SYSTEM SETTINGS — admin-configurable key/value store (see
+# models/system_setting.py). Currently just default_wastage_percent, but
+# built to hold more without another migration.
+# ==========================================
+
+@admin_bp.route('/settings', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def list_settings():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    existing = {s.key: s for s in SystemSetting.query.all()}
+    result = []
+    # Walk the known-settings catalog (not just whatever rows exist) so a
+    # setting nobody has touched yet still shows up with its default and
+    # description instead of being invisible.
+    for key, meta in DEFAULT_SETTINGS.items():
+        row = existing.get(key)
+        result.append({
+            "key": key,
+            "value": row.value if row else meta['value'],
+            "description": meta['description'],
+            "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+            "updated_by": row.user.full_name if row and row.updated_by and row.user else None,
+        })
+    return jsonify({"status": "success", "data": result}), 200
+
+
+@admin_bp.route('/settings/<key>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def update_setting(key):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    if key not in DEFAULT_SETTINGS:
+        return jsonify({"error": f"Unknown setting '{key}'"}), 404
+
+    data = request.get_json(silent=True) or {}
+    if 'value' not in data:
+        return jsonify({"error": "value is required"}), 400
+    new_value = str(data['value'])
+
+    if key == 'default_wastage_percent':
+        try:
+            parsed = float(new_value)
+            if parsed < 0 or parsed > 100:
+                raise ValueError()
+        except ValueError:
+            return jsonify({"error": "default_wastage_percent must be a number between 0 and 100"}), 400
+
+    setting = SystemSetting.query.get(key)
+    before_value = setting.value if setting else DEFAULT_SETTINGS[key]['value']
+    if not setting:
+        setting = SystemSetting(key=key)
+        db.session.add(setting)
+
+    setting.value = new_value
+    setting.updated_by = g.current_user.id
+
+    log_audit(
+        'settings.update', 'system_setting', key,
+        payload_before={"value": before_value},
+        payload_after={"value": new_value},
+    )
+
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"status": "success", "message": f"'{key}' updated", "value": new_value}), 200
+
+
+# ==========================================
+# AUDIT LOGS — read-only, immutable. Supports the filters/sort the
+# Transaction History-style pages already use elsewhere in the app; the
+# frontend layers its usual useSortable/useSearch on top of whatever this
+# returns.
+# ==========================================
+
+@admin_bp.route('/audit-logs', methods=['GET', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('admin_access')
+def list_audit_logs():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    query = AuditLog.query
+
+    action = request.args.get('action')
+    if action:
+        query = query.filter(AuditLog.action == action)
+
+    resource_type = request.args.get('resource_type')
+    if resource_type:
+        query = query.filter(AuditLog.resource_type == resource_type)
+
+    user_id = request.args.get('user_id')
+    if user_id:
+        query = query.filter(AuditLog.user_id == user_id)
+
+    date_from = request.args.get('date_from')  # YYYY-MM-DD
+    if date_from:
+        query = query.filter(AuditLog.created_at >= date_from)
+    date_to = request.args.get('date_to')  # YYYY-MM-DD
+    if date_to:
+        query = query.filter(AuditLog.created_at < f"{date_to} 23:59:59")
+
+    limit = min(request.args.get('limit', 500, type=int) or 500, 2000)
+
+    logs = query.order_by(AuditLog.created_at.desc()).limit(limit).all()
+
+    return jsonify({
+        "status": "success",
+        "data": [{
+            "id": l.id,
+            "user_id": l.user_id,
+            "user_label": l.user_label,
+            "action": l.action,
+            "resource_type": l.resource_type,
+            "resource_id": l.resource_id,
+            "payload_before": l.payload_before,
+            "payload_after": l.payload_after,
+            "ip_address": l.ip_address,
+            "created_at": l.created_at.isoformat() if l.created_at else None,
+        } for l in logs],
+    }), 200
 
 
 

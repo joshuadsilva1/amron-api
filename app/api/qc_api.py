@@ -6,7 +6,7 @@ from app import db
 from app.models.qr_code import QRCodeRegistry
 from app.models.quality import QualityInspectionLog
 from app.models.qc_template import QCTemplate, QCSection, QCCheckpoint, QCInspection, QCObservation
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 from app.core.storage import upload_file
 
 qc_bp = Blueprint('qc', __name__)
@@ -16,6 +16,7 @@ ALLOWED_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.heic'}
 @qc_bp.route('/inspect', methods=['POST'])
 
 @jwt_required
+@permission_required('log_qc')
 def submit_inspection():
     """Logs a QC inspection and updates the bin's status"""
     data = request.get_json()
@@ -130,6 +131,7 @@ def get_template(template_id):
 
 @qc_bp.route('/templates', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def create_template():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -161,6 +163,7 @@ def create_template():
 
 @qc_bp.route('/templates/<template_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def update_template(template_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -188,6 +191,7 @@ def update_template(template_id):
 
 @qc_bp.route('/templates/<template_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def deactivate_template(template_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -209,6 +213,7 @@ def deactivate_template(template_id):
 
 @qc_bp.route('/templates/<template_id>/sections', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def add_section(template_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -240,6 +245,7 @@ def add_section(template_id):
 
 @qc_bp.route('/sections/<section_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def update_section(section_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -262,6 +268,7 @@ def update_section(section_id):
 
 @qc_bp.route('/sections/<section_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def delete_section(section_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -281,6 +288,7 @@ def delete_section(section_id):
 
 @qc_bp.route('/sections/<section_id>/checkpoints', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def add_checkpoint(section_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -315,6 +323,7 @@ def add_checkpoint(section_id):
 
 @qc_bp.route('/checkpoints/<checkpoint_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def update_checkpoint(checkpoint_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -340,6 +349,7 @@ def update_checkpoint(checkpoint_id):
 
 @qc_bp.route('/checkpoints/<checkpoint_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def delete_checkpoint(checkpoint_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
@@ -397,6 +407,7 @@ def _serialize_inspection(inspection, with_observations=False):
 
 @qc_bp.route('/inspections', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def submit_full_inspection():
     """Submits a completed template-based inspection: header + one
     observation per checkpoint x entry label. If tied to a bin
@@ -486,6 +497,7 @@ def submit_full_inspection():
 
 @qc_bp.route('/inspections/<inspection_id>/photos', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('log_qc')
 def upload_drop_test_photos(inspection_id):
     """Attaches the two mandatory drop-test evidence photos to an already-
     submitted inspection. Expects multipart/form-data with both 'photo_1'

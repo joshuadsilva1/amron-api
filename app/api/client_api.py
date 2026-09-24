@@ -1,12 +1,13 @@
 from flask import Blueprint, request, jsonify
 from app import db
 from app.models.client import Client
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 clients_bp = Blueprint('clients', __name__)
 
 @clients_bp.route('/', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('manage_oem')
 def create_client():
     """Adds a new client to the master database"""
     # The OPTIONS check is now handled beautifully by your updated @jwt_required decorator!

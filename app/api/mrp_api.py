@@ -3,7 +3,7 @@ from app import db
 from app.models.item import InternalProduct
 from app.models.supplier import Supplier, SupplierItem
 from app.core.mrp import compute_shortages
-from app.core.decorators import jwt_required
+from app.core.decorators import jwt_required, permission_required
 
 mrp_bp = Blueprint('mrp', __name__)
 
@@ -42,6 +42,7 @@ def get_summary():
 
 @mrp_bp.route('/assign-supplier', methods=['POST', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('create_po', 'manage_suppliers')
 def assign_supplier():
     """Links an item to a supplier so future MRP shortages for it get
     grouped under that supplier instead of 'Unassigned'."""
@@ -76,6 +77,7 @@ def assign_supplier():
 
 @mrp_bp.route('/assign-supplier/<link_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
 @jwt_required
+@permission_required('create_po', 'manage_suppliers')
 def unassign_supplier(link_id):
     if request.method == 'OPTIONS':
         return jsonify({}), 200
