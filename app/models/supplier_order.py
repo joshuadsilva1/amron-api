@@ -22,6 +22,7 @@ class SupplierOrder(db.Model):
     is_active = db.Column(db.Integer, default=1)
     
     items = db.relationship('SupplierOrderItem', backref='supplier_order', lazy=True)
+    materials = db.relationship('SupplierOrderMaterial', backref='supplier_order', lazy=True)
 
 class SupplierOrderItem(db.Model):
     __tablename__ = 'supplier_order_items'
@@ -32,5 +33,24 @@ class SupplierOrderItem(db.Model):
     # Raw materials link directly to internal products
     product_id = db.Column(db.String(36), db.ForeignKey('internal_products.id'), nullable=False)
     
-    ordered_qty = db.Column(db.Integer, nullable=False)
-    received_qty = db.Column(db.Integer, default=0)
+    # Float: raw materials are often ordered by weight (e.g. 3.6 kg powder).
+    ordered_qty = db.Column(db.Float, nullable=False)
+    received_qty = db.Column(db.Float, default=0)
+
+
+class SupplierOrderMaterial(db.Model):
+    """Job work: material WE send to the supplier so they can make the
+    ordered part — e.g. ordering 300 moulded caps from an outside moulder
+    means sending them 300 x (powder per cap from the cap's recipe).
+    Worked out from the ordered item's active recipe when the order is
+    placed (see supplier_api.materials_to_send), so the quantity stays as
+    it was even if the recipe changes later."""
+    __tablename__ = 'supplier_order_materials'
+
+    id = db.Column(db.String(36), primary_key=True, default=generate_uuid)
+    supplier_order_id = db.Column(db.String(36), db.ForeignKey('supplier_orders.id'), nullable=False)
+    product_id = db.Column(db.String(36), db.ForeignKey('internal_products.id'), nullable=False)
+    # Which ordered item this material is for.
+    for_product_id = db.Column(db.String(36), db.ForeignKey('internal_products.id'), nullable=True)
+    quantity = db.Column(db.Float, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)

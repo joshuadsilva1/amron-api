@@ -3,7 +3,7 @@ from .supplier import Supplier, SupplierItem
 from .item import InternalProduct, OEMCompanyCode, BoxMapping
 from .recipe import ProductBOM, BOMVersion
 from .order import PurchaseOrder, POLineItem
-from .supplier_order import SupplierOrder, SupplierOrderItem
+from .supplier_order import SupplierOrder, SupplierOrderItem, SupplierOrderMaterial
 
 # New Floor Operations Models
 from .transaction import InternalChallan, StockTransaction
