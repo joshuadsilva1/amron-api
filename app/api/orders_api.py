@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from app import db
 from app.models.order import PurchaseOrder, POLineItem, PO_STATUS_PIPELINE
 from app.models.item import InternalProduct, OEMCompanyCode
@@ -6,6 +6,7 @@ from app.models.client import Client
 from sqlalchemy import func
 from datetime import datetime
 from app.core.decorators import jwt_required, permission_required
+from app.core.department_levels import final_level_rank, is_finished_good
 
 
 orders_bp = Blueprint('orders', __name__)
@@ -70,10 +71,15 @@ def list_orders():
 def create_po():
     """
     Endpoint for Production Manager to enter a Client PO.
-    Each line item can be given EITHER:
-      - "mapping_id" directly (if the frontend already resolved it), OR
-      - "client_product_code" (the client's own OEM code) + the PO's client_id,
-        in which case we resolve it to the mapping ourselves.
+    Each line item can be given as ANY of:
+      - "product_id" (our item) + optional "client_product_code" — the
+        client's code for it is looked up, or remembered automatically if
+        this is the first time this client orders it (no separate
+        "create the mapping first" step), OR
+      - "mapping_id" directly, OR
+      - "client_product_code" alone, resolved against existing codes.
+    "send_to_departments": true raises the internal department POs in the
+    same step (same as Control Tower's "Send to departments").
     Body: {
       "client_id": "...",
       "due_date": "2026-08-15",      # ISO date, optional
@@ -82,8 +88,10 @@ def create_po():
       "notes": "...",
       "items": [
         {"client_product_code": "HA101", "quantity": 500},
-        {"mapping_id": "...", "quantity": 200}
-      ]
+        {"mapping_id": "...", "quantity": 200},
+        {"product_id": "...", "client_product_code": "HA205", "quantity": 50}
+      ],
+      "send_to_departments": true
     }
     """
     data = request.get_json()
@@ -117,7 +125,36 @@ def create_po():
 
     for item in items:
         mapping_id = item.get('mapping_id')
-        client_product_code = item.get('client_product_code')
+        client_product_code = (item.get('client_product_code') or '').strip() or None
+        product_id = item.get('product_id')
+
+        if not mapping_id and product_id:
+            product = InternalProduct.query.get(product_id)
+            if not product:
+                db.session.rollback()
+                return jsonify({"error": "One of the selected products no longer exists"}), 404
+            if final_level_rank() is not None and not is_finished_good(product):
+                db.session.rollback()
+                return jsonify({
+                    "error": f"{product.item_code} isn't a finished good (it isn't in a top-level department), "
+                             f"so a customer can't order it directly."
+                }), 400
+            mapping = OEMCompanyCode.query.filter_by(client_id=client_id, internal_product_id=product_id).first()
+            if mapping and client_product_code and mapping.client_product_code != client_product_code:
+                mapping.client_product_code = client_product_code
+            if not mapping:
+                # First time this client orders this product: remember their
+                # code for it. Falls back to the code typed on the item
+                # ("Client's product code") and finally our own code.
+                mapping = OEMCompanyCode(
+                    client_id=client_id,
+                    internal_product_id=product_id,
+                    client_product_code=client_product_code or product.oem_company_code or product.item_code,
+                    client_product_name=product.name,
+                )
+                db.session.add(mapping)
+                db.session.flush()
+            mapping_id = mapping.id
 
         if not mapping_id and client_product_code:
             mapping = OEMCompanyCode.query.filter_by(
@@ -126,8 +163,8 @@ def create_po():
             if not mapping:
                 db.session.rollback()
                 return jsonify({
-                    "error": f"No OEM code mapping found for '{client_product_code}' for this client. "
-                             f"Create the mapping first under OEM Company Items."
+                    "error": f"'{client_product_code}' isn't a known product code for this client. "
+                             f"Pick the product from the list instead."
                 }), 404
             mapping_id = mapping.id
 
@@ -150,12 +187,28 @@ def create_po():
         )
         db.session.add(line_item)
 
+    send_result = None
+    if data.get('send_to_departments'):
+        from app.api.department_po_api import _raise_for_po
+        db.session.flush()
+        db.session.refresh(new_po)
+        send_result, _ = _raise_for_po(new_po, g.current_user.id)
+
     try:
         db.session.commit()
-        return jsonify({"status": "success", "message": "PO Created", "po_id": new_po.id}), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+    return jsonify({
+        "status": "success",
+        "message": "PO Created",
+        "po_id": new_po.id,
+        # None when not requested; otherwise {"ok", "changed", "message"} —
+        # ok=False (e.g. a product has no recipe yet) still saves the PO,
+        # it just hasn't gone to departments.
+        "send_result": send_result,
+    }), 201
 
 @orders_bp.route('/statuses', methods=['GET'], strict_slashes=False)
 @jwt_required

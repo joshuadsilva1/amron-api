@@ -2,6 +2,8 @@ from flask import Blueprint, request, jsonify
 from app import db
 from app.models.item import InternalProduct
 from app.models.department import Department, DepartmentLevel
+from app.models.unit import UnitOfMeasure
+from app.core.department_levels import final_level_rank
 from app.core.decorators import jwt_required, permission_required
 from app.core.audit import log_audit
 
@@ -59,12 +61,22 @@ def get_items():
 
     items = query.all()
 
+    # Finished good = lives in a department on the top level (see
+    # app/core/department_levels.py). Resolved here once so screens
+    # (PO product picker, price field) don't each re-derive it.
+    final_rank = final_level_rank()
+    final_dept_ids = {
+        d.id for d in Department.query.filter_by(department_level=final_rank).all()
+    } if final_rank is not None else set()
+
     result = [{
         "id": str(i.id),
         "item_code": i.item_code,
         "oem_company_code": i.oem_company_code,
         "name": i.name,
+        "description": i.description,
         "department_id": i.department_id,
+        "is_finished_good": i.department_id in final_dept_ids,
         "category": i.category,
         "subcategory": i.subcategory,
         "unit_of_measure": i.unit_of_measure,
@@ -103,6 +115,7 @@ def create_item():
         item_code=item_code,
         oem_company_code=data.get('oem_company_code'),
         name=data.get('name'),
+        description=data.get('description') or None,
         department_id=data.get('department_id'),
         category=data.get('category'),
         subcategory=data.get('subcategory'),
@@ -143,10 +156,25 @@ def update_item(item_id):
         existing = InternalProduct.query.filter_by(item_code=data['item_code']).first()
         if existing:
             return jsonify({"error": f"Item code {data['item_code']} is already taken."}), 409
+        # The printed QR label encodes item_code (see labels_api), so
+        # changing it makes every label already stuck on a package stop
+        # scanning. Only allowed when the caller explicitly confirms.
+        if not data.get('confirm_code_change'):
+            return jsonify({
+                "error": "Changing the item code will make QR labels already printed for this item stop scanning. "
+                         "Confirm the change to continue.",
+                "code": "confirm_code_change",
+            }), 409
+        log_audit(
+            'item.item_code.update', 'internal_product', item_id,
+            payload_before={"item_code": item.item_code},
+            payload_after={"item_code": data['item_code']},
+        )
 
     if 'item_code' in data: item.item_code = data['item_code']
     if 'oem_company_code' in data: item.oem_company_code = data['oem_company_code']
     if 'name' in data: item.name = data['name']
+    if 'description' in data: item.description = data['description'] or None
     if 'department_id' in data: item.department_id = data['department_id']
     if 'category' in data: item.category = data['category']
     if 'subcategory' in data: item.subcategory = data['subcategory']
@@ -196,3 +224,61 @@ def update_item(item_id):
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+@items_bp.route('/units', methods=['GET'], strict_slashes=False)
+@jwt_required
+def list_units():
+    units = UnitOfMeasure.query.order_by(UnitOfMeasure.name.asc()).all()
+    return jsonify({"status": "success", "data": [
+        {"id": u.id, "name": u.name, "description": u.description} for u in units
+    ]}), 200
+
+
+@items_bp.route('/units', methods=['POST', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('scan_inventory', 'manage_recipes')
+def create_unit():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({"error": "Unit name is required"}), 400
+    if len(name) > 20:
+        return jsonify({"error": "Unit name must be 20 characters or fewer"}), 400
+    if UnitOfMeasure.query.filter(db.func.lower(UnitOfMeasure.name) == name.lower()).first():
+        return jsonify({"error": f"Unit '{name}' already exists"}), 409
+
+    unit = UnitOfMeasure(name=name, description=(data.get('description') or '').strip() or None)
+    db.session.add(unit)
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "success", "id": unit.id, "name": unit.name}), 201
+
+
+@items_bp.route('/units/<int:unit_id>', methods=['DELETE', 'OPTIONS'], strict_slashes=False)
+@jwt_required
+@permission_required('scan_inventory', 'manage_recipes')
+def delete_unit(unit_id):
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    unit = UnitOfMeasure.query.get(unit_id)
+    if not unit:
+        return jsonify({"error": "Unit not found"}), 404
+    in_use = InternalProduct.query.filter_by(unit_of_measure=unit.name, is_active=1).count()
+    if in_use:
+        return jsonify({"error": f"'{unit.name}' is used by {in_use} item(s) — change them first."}), 409
+
+    db.session.delete(unit)
+    try:
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "success"}), 200

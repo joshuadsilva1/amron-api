@@ -201,10 +201,36 @@ def create_recipe():
             "status": "success",
             "message": f"Recipe v{next_version_num} saved for {finished_good.name}",
             "version": next_version_num,
+            "unsent_po_ids": _unsent_po_ids_for(finished_good_id),
         }), 201
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
+
+
+def _unsent_po_ids_for(finished_good_id):
+    """Active customer POs ordering this item that were never sent to
+    departments (still before Material Check, no internal PO raised) —
+    typically because the item had no recipe when the PO was entered.
+    Lets the recipe screen offer to send them right after saving."""
+    from app.models.order import PurchaseOrder, POLineItem, PO_STATUS_PIPELINE
+    from app.models.item import OEMCompanyCode
+    from app.models.department_po import DepartmentPO
+    early = PO_STATUS_PIPELINE[:PO_STATUS_PIPELINE.index('Material Check')]
+    rows = (
+        db.session.query(PurchaseOrder.id)
+        .join(POLineItem, POLineItem.order_id == PurchaseOrder.id)
+        .join(OEMCompanyCode, POLineItem.mapping_id == OEMCompanyCode.id)
+        .filter(
+            OEMCompanyCode.internal_product_id == finished_good_id,
+            PurchaseOrder.is_active == 1,
+            PurchaseOrder.status.in_(early),
+            ~db.session.query(DepartmentPO.id).filter(DepartmentPO.source_po_id == PurchaseOrder.id).exists(),
+        )
+        .distinct()
+        .all()
+    )
+    return [r[0] for r in rows]
 
 
 @recipes_bp.route('/<finished_good_id>', methods=['GET'], strict_slashes=False)

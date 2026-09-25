@@ -9,7 +9,8 @@ class InternalProduct(db.Model):
     item_code = db.Column(db.String(50), unique=True, nullable=True) 
     oem_company_code = db.Column(db.String(100), nullable=True)
     name = db.Column(db.String(150), nullable=False)
-    
+    description = db.Column(db.Text, nullable=True)
+
     # --- NORMALIZED DEPARTMENT LINK ---
     department_id = db.Column(db.String(36), db.ForeignKey('departments.id'), nullable=True)
     department = db.relationship('Department', backref='items')
